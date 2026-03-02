@@ -665,6 +665,14 @@ class DataService:
                             end_date,
                         ),
                     ),
+                    (
+                        "tencent",
+                        lambda: self._filter_by_date(
+                            ak.stock_zh_index_daily_tx(symbol=prefixed_symbol),
+                            start_date,
+                            end_date,
+                        ),
+                    ),
                 ],
                 errors=errors,
             )
@@ -689,6 +697,22 @@ class DataService:
                     return sparse_candidate.reset_index(drop=True)
         except Exception as exc:
             errors.append(f"sina:{exc}")
+
+        try:
+            df_tx = ak.stock_zh_index_daily_tx(symbol=prefixed_symbol)
+            filtered_tx = self._filter_by_date(df_tx, start_date, end_date)
+            if not self._is_sparse_result(filtered_tx, span_days, minute_mode=False):
+                if self._is_valid_daily_series(filtered_tx, span_days):
+                    return filtered_tx
+                sparse_candidate = filtered_tx
+                errors.append("tencent:low_density")
+            else:
+                sparse_candidate = filtered_tx
+                errors.append("tencent:sparse_result")
+                if span_days is not None and span_days <= 3:
+                    return sparse_candidate.reset_index(drop=True)
+        except Exception as exc:
+            errors.append(f"tencent:{exc}")
 
         if sparse_candidate is not None:
             return sparse_candidate.reset_index(drop=True)

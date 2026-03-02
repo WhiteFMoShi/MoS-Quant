@@ -127,13 +127,14 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(16, 16, 16, 16)
         main_layout.setSpacing(8)
 
-        left_shell = QFrame()
-        left_shell.setObjectName("leftShell")
-        left_shell.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
-        left_shell_layout = QHBoxLayout(left_shell)
+        self.left_shell = QFrame()
+        self.left_shell.setObjectName("leftShell")
+        self.left_shell.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        left_shell_layout = QHBoxLayout(self.left_shell)
         left_shell_layout.setContentsMargins(0, 0, 0, 0)
         left_shell_layout.setSpacing(8)
-        left_shell.setFixedWidth(self.NAV_WIDTH + self.LEFT_PANEL_WIDTH + left_shell_layout.spacing())
+        self._left_shell_spacing = left_shell_layout.spacing()
+        self.left_shell.setFixedWidth(self.NAV_WIDTH + self.LEFT_PANEL_WIDTH + self._left_shell_spacing)
 
         self.nav_rail = QFrame()
         self.nav_rail.setObjectName("navRail")
@@ -186,23 +187,7 @@ class MainWindow(QMainWindow):
         watch_desc.setObjectName("panelDesc")
         watch_layout.addWidget(watch_title)
         watch_layout.addWidget(watch_desc)
-
-        watch_card = QFrame()
-        watch_card.setObjectName("watchCard")
-        watch_card_layout = QVBoxLayout(watch_card)
-        watch_card_layout.setContentsMargins(8, 8, 8, 8)
-        watch_card_layout.setSpacing(0)
-        self.watch_list = QListWidget()
-        self.watch_list.setObjectName("watchList")
-        self.watch_list.itemDoubleClicked.connect(self._on_watch_item_activated)
-        self.watch_list.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.watch_list.customContextMenuRequested.connect(self._on_watch_list_context_menu)
-        watch_card_layout.addWidget(self.watch_list, 1)
-        watch_layout.addWidget(watch_card, 1)
-
-        watch_hint = QLabel("双击自选项可切换到“行情”并刷新")
-        watch_hint.setObjectName("watchHint")
-        watch_layout.addWidget(watch_hint)
+        watch_layout.addStretch(1)
 
         market_control_page = QFrame()
         market_control_page.setObjectName("controlPanel")
@@ -432,11 +417,29 @@ class MainWindow(QMainWindow):
         self._symbol_completer.setPopup(completer_popup)
         self.quick_symbol_input.setCompleter(self._symbol_completer)
 
-        watch_right = QWidget()
+        watch_right = QFrame()
+        watch_right.setObjectName("resultPanel")
         watch_right_layout = QVBoxLayout(watch_right)
-        watch_right_layout.setContentsMargins(0, 0, 0, 0)
-        watch_right_layout.setSpacing(0)
-        watch_right_layout.addStretch(1)
+        watch_right_layout.setContentsMargins(16, 16, 16, 16)
+        watch_right_layout.setSpacing(10)
+
+        watch_right_title = QLabel("自选列表")
+        watch_right_title.setObjectName("resultTitle")
+        watch_right_layout.addWidget(watch_right_title)
+
+        watch_card = QFrame()
+        watch_card.setObjectName("watchCard")
+        watch_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        watch_card_layout = QVBoxLayout(watch_card)
+        watch_card_layout.setContentsMargins(8, 8, 8, 8)
+        watch_card_layout.setSpacing(0)
+        self.watch_list = QListWidget()
+        self.watch_list.setObjectName("watchList")
+        self.watch_list.itemDoubleClicked.connect(self._on_watch_item_activated)
+        self.watch_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.watch_list.customContextMenuRequested.connect(self._on_watch_list_context_menu)
+        watch_card_layout.addWidget(self.watch_list, 1)
+        watch_right_layout.addWidget(watch_card, 1)
 
         analysis_right = QFrame()
         analysis_right.setObjectName("resultPanel")
@@ -658,7 +661,7 @@ class MainWindow(QMainWindow):
         left_shell_layout.addWidget(self.nav_rail)
         left_shell_layout.addWidget(self.left_pages)
 
-        main_layout.addWidget(left_shell)
+        main_layout.addWidget(self.left_shell)
         main_layout.addWidget(self.right_pages, 1)
 
         self.floating_pod = QFrame(root)
@@ -1075,6 +1078,7 @@ class MainWindow(QMainWindow):
         self.nav_market_btn.setChecked(index == self.PAGE_MARKET)
         self.nav_data_btn.setChecked(index == self.PAGE_DATA)
         self.nav_help_btn.setChecked(index == self.PAGE_HELP)
+        self._set_left_aux_visible(index != self.PAGE_WATCH)
         if index == self.PAGE_WATCH:
             self.right_pages.setCurrentIndex(self.RIGHT_PAGE_WATCH)
         elif index == self.PAGE_MARKET:
@@ -1089,6 +1093,14 @@ class MainWindow(QMainWindow):
         if index == self.PAGE_MARKET and not self._market_initialized:
             self._market_initialized = True
             self._trigger_market_fetch()
+
+    def _set_left_aux_visible(self, visible: bool) -> None:
+        self.left_pages.setVisible(visible)
+        if visible:
+            width = self.NAV_WIDTH + self.LEFT_PANEL_WIDTH + self._left_shell_spacing
+        else:
+            width = self.NAV_WIDTH
+        self.left_shell.setFixedWidth(width)
 
     def _load_watchlist(self) -> None:
         if not self._watchlist_file.exists():
@@ -1561,6 +1573,7 @@ class MainWindow(QMainWindow):
         text = text.replace("eastmoney:", "东财源: ")
         text = text.replace("sina:", "新浪源: ")
         text = text.replace("tencent:", "腾讯源: ")
+        text = text.replace("新浪源: date", "新浪源: 时间字段解析异常（上游格式波动）")
         text = text.replace("index_min:", "指数分钟源: ")
         text = text.replace("RemoteDisconnected", "远端连接中断")
         text = text.replace("Connection aborted.", "连接被中断")
@@ -1574,7 +1587,7 @@ class MainWindow(QMainWindow):
         text = re.sub(r"Remote end closed connection without response", "远端未返回响应", text)
         text = re.sub(r"You might want to try:.*?(?=\s*\|\s*|$)", "建议稍后重试。", text)
         text = re.sub(
-            r'time data\s+"[^"]+"\s+doesnt match format\s+"[^"]+"',
+            r"time data\s+['\"][^'\"]+['\"]\s+doesn?t match format\s+['\"][^'\"]+['\"]",
             "时间字段格式异常（上游源格式波动）",
             text,
         )
