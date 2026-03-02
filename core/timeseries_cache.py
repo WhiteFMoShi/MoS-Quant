@@ -28,14 +28,20 @@ class TimeSeriesCache:
 
     def load(self, params: dict[str, str], minute_mode: bool) -> tuple[pd.DataFrame, Path | None]:
         parquet_path, pickle_path = self.cache_paths(params)
-        cached_path = self.existing_path(parquet_path, pickle_path)
-        if cached_path is None:
+        candidates: list[Path] = []
+        if parquet_path.exists():
+            candidates.append(parquet_path)
+        if pickle_path.exists():
+            candidates.append(pickle_path)
+        if not candidates:
             return pd.DataFrame(), None
-        try:
-            loaded = self.read_dataframe(cached_path)
-        except Exception:
-            return pd.DataFrame(), None
-        return self.normalize(loaded, minute_mode), cached_path
+        for candidate in candidates:
+            try:
+                loaded = self.read_dataframe(candidate)
+                return self.normalize(loaded, minute_mode), candidate
+            except Exception:
+                continue
+        return pd.DataFrame(), None
 
     def save(self, params: dict[str, str], df: pd.DataFrame) -> Path:
         parquet_path, pickle_path = self.cache_paths(params)
@@ -61,6 +67,12 @@ class TimeSeriesCache:
             df.to_parquet(parquet_path, index=False)
             return parquet_path
         except Exception:
+            # Prevent unreadable stale parquet from shadowing valid pickle cache.
+            try:
+                if parquet_path.exists():
+                    parquet_path.unlink()
+            except Exception:
+                pass
             df.to_pickle(pickle_path)
             return pickle_path
 
@@ -265,7 +277,15 @@ class TimeSeriesCache:
         today = pd.Timestamp(datetime.now().date())
         # If requested end is today/future, market may not have produced close data yet.
         if end_ts >= today:
-            return True
+            if pd.Timestamp(ts_max).normalize() >= today:
+                return True
+            now_ts = pd.Timestamp.now()
+            if today.dayofweek >= 5:
+                return True
+            market_open = today + pd.Timedelta(hours=9, minutes=30)
+            if now_ts < market_open:
+                return True
+            return False
         if end_ts < (today - pd.Timedelta(days=1)):
             return False
         return end_ts.dayofweek >= 5

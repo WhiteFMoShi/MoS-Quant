@@ -1006,52 +1006,13 @@ class MarketChartWidget(QWidget):
         high_series = safe["_high"]
         low_series = safe["_low"]
 
-        segment_break = pd.Series(False, index=safe.index)
-        jump_threshold = 0.35
-        if pd.api.types.is_datetime64_any_dtype(safe["_ts"]):
-            ts = pd.to_datetime(safe["_ts"], errors="coerce")
-            dt_sec = ts.diff().dt.total_seconds()
-            positive_steps = dt_sec[dt_sec > 0]
-            if not positive_steps.empty:
-                median_step = float(positive_steps.median())
-                if math.isfinite(median_step) and median_step > 0:
-                    if median_step <= 3600:
-                        gap_threshold = 86400 * 10
-                        jump_threshold = 0.35
-                    else:
-                        gap_threshold = median_step * 20
-                        # For daily/weekly/monthly bars, large swings can be real trends.
-                        # Use a looser jump threshold to avoid indicator resets on valid moves.
-                        if median_step <= 86400 * 2:
-                            jump_threshold = 0.8
-                        elif median_step <= 86400 * 10:
-                            jump_threshold = 1.2
-                        else:
-                            jump_threshold = 2.0
-                    segment_break |= dt_sec > gap_threshold
+        # Keep indicators continuous across the sorted series to align with common trading software.
+        safe["_ma5"] = close_series.rolling(window=5, min_periods=5).mean()
+        safe["_ma10"] = close_series.rolling(window=10, min_periods=10).mean()
+        safe["_ma20"] = close_series.rolling(window=20, min_periods=20).mean()
 
-        close_jump = close_series.pct_change().abs()
-        segment_break |= close_jump > jump_threshold
-        if len(segment_break.index) > 0:
-            segment_break.iloc[0] = True
-        segment_id = segment_break.cumsum().astype(int)
-
-        safe["_ma5"] = close_series.groupby(segment_id).transform(
-            lambda s: s.rolling(window=5, min_periods=5).mean()
-        )
-        safe["_ma10"] = close_series.groupby(segment_id).transform(
-            lambda s: s.rolling(window=10, min_periods=10).mean()
-        )
-        safe["_ma20"] = close_series.groupby(segment_id).transform(
-            lambda s: s.rolling(window=20, min_periods=20).mean()
-        )
-
-        mid = close_series.groupby(segment_id).transform(
-            lambda s: s.rolling(window=20, min_periods=1).mean()
-        )
-        std = close_series.groupby(segment_id).transform(
-            lambda s: s.rolling(window=20, min_periods=1).std(ddof=0)
-        )
+        mid = close_series.rolling(window=20, min_periods=1).mean()
+        std = close_series.rolling(window=20, min_periods=1).std(ddof=0)
         safe["_boll_mid"] = mid
         safe["_boll_up"] = mid + std * 2
         safe["_boll_low"] = mid - std * 2
@@ -1065,40 +1026,23 @@ class MarketChartWidget(QWidget):
         safe["_macd_dea"] = dea
         safe["_macd_hist"] = (dif - dea) * 2
 
-        low_n = low_series.groupby(segment_id).transform(lambda s: s.rolling(window=9, min_periods=1).min())
-        high_n = high_series.groupby(segment_id).transform(lambda s: s.rolling(window=9, min_periods=1).max())
+        low_n = low_series.rolling(window=9, min_periods=1).min()
+        high_n = high_series.rolling(window=9, min_periods=1).max()
         denom = (high_n - low_n).replace(0, np.nan)
         rsv = ((close_series - low_n) / denom * 100).fillna(50.0)
-        k = rsv.groupby(segment_id).transform(lambda s: s.ewm(com=2, adjust=False).mean())
-        d = k.groupby(segment_id).transform(lambda s: s.ewm(com=2, adjust=False).mean())
+        k = rsv.ewm(com=2, adjust=False).mean()
+        d = k.ewm(com=2, adjust=False).mean()
         safe["_kdj_k"] = k
         safe["_kdj_d"] = d
         safe["_kdj_j"] = 3 * k - 2 * d
 
-        delta = close_series.groupby(segment_id).diff()
+        delta = close_series.diff()
         gain = delta.clip(lower=0)
         loss = -delta.clip(upper=0)
-        avg_gain = gain.groupby(segment_id).transform(
-            lambda s: s.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
-        )
-        avg_loss = loss.groupby(segment_id).transform(
-            lambda s: s.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
-        )
+        avg_gain = gain.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
         rs = avg_gain / avg_loss.replace(0, np.nan)
         safe["_rsi14"] = (100 - (100 / (1 + rs))).fillna(50.0)
-
-        segment_starts = safe.index[segment_break]
-        if len(segment_starts) > 0:
-            indicator_cols = [
-                "_ma5",
-                "_ma10",
-                "_ma20",
-                "_kdj_k",
-                "_kdj_d",
-                "_kdj_j",
-                "_rsi14",
-            ]
-            safe.loc[segment_starts, indicator_cols] = np.nan
 
         return safe
 

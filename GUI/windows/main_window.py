@@ -10,7 +10,7 @@ from pathlib import Path
 
 import akshare as ak
 import pandas as pd
-from PySide6.QtCore import QDate, QLocale, QPoint, Qt, QThread, QTime, QSignalBlocker, Signal, QStringListModel
+from PySide6.QtCore import QDate, QLocale, QPoint, Qt, QThread, QSignalBlocker, Signal, QStringListModel
 from PySide6.QtGui import QBrush, QColor, QFont, QIcon, QKeySequence, QShortcut, QTextCharFormat
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -117,6 +117,9 @@ class MainWindow(QMainWindow):
         self._watch_spot_snapshot_file = watch_cache_dir / "spot_snapshot.json"
         self._watch_manual_width_cols: set[int] = set()
         self._watch_resizing_columns = False
+        self._watch_spot_last_notify_ts = 0.0
+        self._last_progress_log_text = ""
+        self._last_progress_log_ts = 0.0
         self._load_watch_spot_snapshot()
         market_cache_dir = self._cache_root / "market"
         market_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -708,7 +711,7 @@ class MainWindow(QMainWindow):
         self.progress_status = QLabel("下载中")
         self.progress_status.setObjectName("floatingStatus")
         self.progress_status.setVisible(True)
-        self.progress_status.setMinimumWidth(92)
+        self.progress_status.setMinimumWidth(176)
         self.progress_percent = QLabel("0%")
         self.progress_percent.setObjectName("floatingPercent")
         progress_row.addWidget(self.progress_status, 1)
@@ -719,7 +722,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setObjectName("fetchProgressBar")
         self.progress_bar.setTextVisible(False)
         self.progress_bar.setFixedHeight(12)
-        self.progress_bar.setFixedWidth(188)
+        self.progress_bar.setFixedWidth(268)
         progress_layout.addWidget(self.progress_bar)
 
         self.progress_block.setVisible(False)
@@ -956,11 +959,6 @@ class MainWindow(QMainWindow):
             while d.dayOfWeek() > 5:
                 d = d.addDays(-1)
             return d
-        # A-share daily bars are usually stable only after market close.
-        if QTime.currentTime() < QTime(15, 5):
-            d = d.addDays(-1)
-        while d.dayOfWeek() > 5:
-            d = d.addDays(-1)
         return d
 
     def _tune_date_calendars(self) -> None:
@@ -1188,6 +1186,10 @@ class MainWindow(QMainWindow):
                 return
         if not force and (not cache_missing_key_metrics) and (time.time() - self._watch_spot_cache_ts) <= 15:
             return
+        now = time.time()
+        if (now - self._watch_spot_last_notify_ts) >= 5:
+            self._watch_spot_last_notify_ts = now
+            self._append_log(f"自选行情后台更新中: {len(self._watchlist)} 只")
         self._watch_spot_loading = True
         threading.Thread(target=self._load_watch_spot_async, daemon=True).start()
 
@@ -1279,6 +1281,25 @@ class MainWindow(QMainWindow):
                 if data is None:
                     data = {}
                 data.update(fallback)
+        metric_missing = [
+            c
+            for c in self._watchlist
+            if (data is None)
+            or (c not in data)
+            or (data.get(c, {}).get("turnover") is None)
+            or (data.get(c, {}).get("speed") is None)
+        ]
+        if metric_missing:
+            metric_patch = self._load_watch_spot_fallback_by_symbol(metric_missing)
+            if metric_patch:
+                if data is None:
+                    data = {}
+                for code, patch in metric_patch.items():
+                    base = data.get(code, {})
+                    for key in ("name", "price", "pct", "chg", "speed", "turnover"):
+                        if (base.get(key) is None) and (patch.get(key) is not None):
+                            base[key] = patch.get(key)
+                    data[code] = base
 
         if not data:
             if issues:
@@ -1320,6 +1341,8 @@ class MainWindow(QMainWindow):
         if prev_spot and prev_ts > 0:
             dt = max(1.0, now_ts - prev_ts)
             for code, payload in spot.items():
+                if payload.get("turnover") is None:
+                    payload["turnover"] = prev_spot.get(code, {}).get("turnover")
                 if payload.get("speed") is not None:
                     continue
                 cur = self._to_float(payload.get("price"))
@@ -1327,12 +1350,15 @@ class MainWindow(QMainWindow):
                 if cur is None or prev in (None, 0):
                     continue
                 payload["speed"] = (cur - float(prev)) / float(prev) * 100 * 60.0 / dt
-                if payload.get("turnover") is None:
-                    payload["turnover"] = prev_spot.get(code, {}).get("turnover")
         self._watch_spot_cache = spot
         self._watch_spot_cache_ts = now_ts
         self._save_watch_spot_snapshot(spot, self._watch_spot_cache_ts)
         self._apply_watch_spot_data(spot)
+        miss_speed = sum(1 for code in self._watchlist if spot.get(code, {}).get("speed") is None)
+        miss_turn = sum(1 for code in self._watchlist if spot.get(code, {}).get("turnover") is None)
+        self._append_log(
+            f"自选行情已更新: {len(self._watchlist)} 只 | 缺涨速 {miss_speed} | 缺换手 {miss_turn}"
+        )
 
     def _apply_watch_spot_data(self, spot: dict[str, dict[str, object]]) -> None:
         for row, symbol in enumerate(self._watchlist):
@@ -1409,12 +1435,12 @@ class MainWindow(QMainWindow):
                 pass
 
         loaders = (
-            lambda: self._fetch_watch_sina_daily_safe(symbol=quote, start_date=start_date, end_date=end_date, adjust="qfq"),
-            lambda: ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, end_date=end_date, adjust="qfq"),
-            lambda: ak.stock_zh_a_hist_tx(symbol=quote, start_date=start_date, end_date=end_date, adjust="qfq"),
+            ("sina_daily", lambda: self._fetch_watch_sina_daily_safe(symbol=quote, start_date=start_date, end_date=end_date, adjust="qfq")),
+            ("eastmoney_daily", lambda: ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")),
+            ("tencent_daily", lambda: ak.stock_zh_a_hist_tx(symbol=quote, start_date=start_date, end_date=end_date, adjust="qfq")),
         )
         best_payload: dict[str, object] | None = None
-        for loader in loaders:
+        for source_name, loader in loaders:
             try:
                 df = loader()
                 if df is None or df.empty:
@@ -1442,7 +1468,7 @@ class MainWindow(QMainWindow):
                     "pct": pct_val,
                     "chg": chg_val,
                     "speed": speed_val,
-                    "turnover": self._to_float(df.iloc[-1][turn_col]) if turn_col else turnover_val,
+                    "turnover": self._normalize_turnover_pct(df.iloc[-1][turn_col], source=source_name) if turn_col else turnover_val,
                 }
                 if payload.get("turnover") is not None:
                     return payload
@@ -1507,6 +1533,14 @@ class MainWindow(QMainWindow):
             return pd.DataFrame()
         mask = series.between(start, end)
         return df.loc[mask].reset_index(drop=True)
+
+    def _normalize_turnover_pct(self, value: object, *, source: str = "") -> float | None:
+        parsed = self._to_float(value)
+        if parsed is None:
+            return None
+        if source == "sina_daily":
+            return float(parsed) * 100.0
+        return float(parsed)
 
     @staticmethod
     def _normalize_a_quote_symbol(code: str) -> str:
@@ -1903,8 +1937,7 @@ class MainWindow(QMainWindow):
 
     def _on_market_refresh_clicked(self) -> None:
         request = self._build_market_request()
-        if self._try_render_market_from_memory_cache(request):
-            return
+        # Always route refresh through the data service so cache freshness rules apply.
         self._active_fetch_scene = "market"
         self._set_fetch_buttons_enabled(False)
         self._set_fetch_progress(active=True)
@@ -2029,19 +2062,26 @@ class MainWindow(QMainWindow):
     def _on_fetch_progress(self, percent: int, message: str) -> None:
         if self.progress_block.isHidden():
             return
+        now = time.time()
         value = max(0, min(100, int(percent)))
+        raw_message = (message or "下载中").strip()
         self.progress_bar.setValue(value)
-        self.progress_status.setText(self._compact_progress_text(message or "下载中"))
+        self.progress_status.setText(self._compact_progress_text(raw_message))
+        self.progress_status.setToolTip(raw_message)
         self.progress_percent.setText(f"{value}%")
+        if (
+            raw_message != self._last_progress_log_text
+            and (now - self._last_progress_log_ts) >= 1.5
+            and value < 100
+        ):
+            self._last_progress_log_text = raw_message
+            self._last_progress_log_ts = now
+            self._append_log(f"下载进度 {value}%: {raw_message}")
 
     @staticmethod
     def _compact_progress_text(message: str) -> str:
-        text = (message or "").strip()
-        if not text:
-            return "下载中"
-        if len(text) <= 10:
-            return text
-        return f"{text[:10]}…"
+        text = re.sub(r"\s+", " ", str(message or "")).strip()
+        return text or "下载中"
 
     @staticmethod
     def _humanize_fetch_error(message: str) -> str:
@@ -2062,6 +2102,8 @@ class MainWindow(QMainWindow):
         text = text.replace("Read timed out", "请求超时")
         text = text.replace("sparse_result", "该时间段返回为空（可能休市）")
         text = text.replace("low_density", "返回序列异常稀疏（上游数据不完整）")
+        text = text.replace("stale_tail", "返回数据末端滞后（未到最新交易日）")
+        text = text.replace("all_sources_stale", "所有可用源返回旧数据（未到最新交易日）")
         text = text.replace(
             "Value based partial slicing on non-monotonic DatetimeIndexes with non-existing keys is not allowed",
             "时间索引异常（上游源数据有缺陷）",
@@ -2084,6 +2126,10 @@ class MainWindow(QMainWindow):
             hints.append("网络波动或上游源站不稳定")
         if "sparse_result" in raw:
             hints.append("所选区间可能是休市日或无交易数据")
+        if "stale_tail" in raw:
+            hints.append("上游源返回较旧数据，系统已尝试切换其它源")
+        if "all_sources_stale" in raw:
+            hints.append("多个源都返回旧数据，建议稍后重试或切换周期验证")
         if "index_min" in raw:
             hints.append("分钟级指数接口不稳定，可先切换到日线验证")
         if "doesnt match format" in raw:
@@ -3371,7 +3417,7 @@ class MainWindow(QMainWindow):
             return "error"
         if "抓取完成" in message or "已加载" in message or "已更新" in message:
             return "success"
-        if "开始抓取" in message or "正在" in message:
+        if "开始抓取" in message or "正在" in message or "下载进度" in message or "更新中" in message:
             return "info"
         if "缓存文件" in message or "缓存目录" in message:
             return "muted"
@@ -3384,6 +3430,8 @@ class MainWindow(QMainWindow):
             self.progress_bar.setValue(3)
             self.progress_status.setText("准备下载")
             self.progress_percent.setText("3%")
+            self._last_progress_log_text = ""
+            self._last_progress_log_ts = 0.0
         else:
             self.progress_bar.setRange(0, 100)
             self.progress_bar.setValue(0)

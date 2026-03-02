@@ -109,6 +109,7 @@ class DataService:
                 start_date=s,
                 end_date=e,
                 period=period,
+                progress_cb=progress_cb,
             )
             minute_mode = False
         try:
@@ -226,6 +227,7 @@ class DataService:
                 start_date=s,
                 end_date=e,
                 period=period,
+                progress_cb=progress_cb,
             )
             minute_mode = False
         try:
@@ -369,7 +371,10 @@ class DataService:
             self._emit_progress(progress_cb, 16, f"缓存增量区间 {total} 段")
         for idx, (start_text, end_text) in enumerate(ranges_to_fetch, start=1):
             phase = 18 + int((idx - 1) / max(total, 1) * 52)
-            label = "下载主数据" if total == 1 else f"下载区间 {idx}/{total}"
+            if total == 1:
+                label = f"下载主数据 {start_text}~{end_text}"
+            else:
+                label = f"下载区间 {idx}/{total} {start_text}~{end_text}"
             self._emit_progress(progress_cb, phase, label)
             quick_incremental = (not request.force_refresh) and (not cached_df.empty)
             try:
@@ -379,6 +384,9 @@ class DataService:
                         action_name=f"{action_name} {start_text}-{end_text}",
                         retries=1 if quick_incremental else (2 if minute_mode else 3),
                         delay_seconds=0.2 if quick_incremental else (0.6 if minute_mode else 0.8),
+                        progress_cb=progress_cb,
+                        progress_percent=phase,
+                        task_label=(f"区间{idx}/{total}" if total > 1 else "主区间"),
                     )
                 )
             except Exception as exc:
@@ -426,6 +434,9 @@ class DataService:
                     action_name=f"{action_name} 全量修复",
                     retries=1 if minute_mode else 2,
                     delay_seconds=0.6 if minute_mode else 0.8,
+                    progress_cb=progress_cb,
+                    progress_percent=78,
+                    task_label="全量修复",
                 )
                 repaired_norm = self._series_cache.normalize(repaired, minute_mode)
                 if not repaired_norm.empty:
@@ -498,7 +509,13 @@ class DataService:
                     pass
 
         self._emit_progress(progress_cb, 28, "下载数据")
-        df = self._call_with_retry(fetch_func=fetch_func, action_name=action_name)
+        df = self._call_with_retry(
+            fetch_func=fetch_func,
+            action_name=action_name,
+            progress_cb=progress_cb,
+            progress_percent=28,
+            task_label="主任务",
+        )
         self._emit_progress(progress_cb, 80, "写入缓存")
         cache_path = self._write_cache_dataframe(df, parquet_path, pickle_path)
         self._emit_progress(progress_cb, 100, "完成")
@@ -529,13 +546,16 @@ class DataService:
         start_date: str,
         end_date: str,
         period: str = "daily",
+        progress_cb: Callable[[int, str], None] | None = None,
     ) -> pd.DataFrame:
         prefixed_symbol = self._normalize_stock_symbol(symbol)
         errors: list[str] = []
         span_days = self._range_span_days(start_date, end_date, minute_mode=False)
         sparse_candidate: pd.DataFrame | None = None
+        stale_candidate: pd.DataFrame | None = None
 
         try:
+            self._emit_progress(progress_cb, 32, f"网络任务: 东财日线 {symbol} 任务15%")
             df = ak.stock_zh_a_hist(
                 symbol=symbol,
                 period=period,
@@ -544,10 +564,20 @@ class DataService:
                 adjust="qfq",
             )
             if not self._is_sparse_result(df, span_days, minute_mode=False):
-                if period != "daily" or self._is_valid_daily_series(df, span_days):
+                if period != "daily":
+                    if self._is_series_tail_stale(df, end_date=end_date, period=period):
+                        stale_candidate = df
+                        errors.append("eastmoney:stale_tail")
+                    else:
+                        return df
+                elif self._is_daily_tail_stale(df, end_date=end_date):
+                    stale_candidate = df
+                    errors.append("eastmoney:stale_tail")
+                elif self._is_valid_daily_series(df, span_days):
                     return df
-                sparse_candidate = df
-                errors.append("eastmoney:low_density")
+                else:
+                    sparse_candidate = df
+                    errors.append("eastmoney:low_density")
             else:
                 sparse_candidate = df
                 errors.append("eastmoney:sparse_result")
@@ -590,25 +620,34 @@ class DataService:
                     ),
                 ],
                 errors=errors,
+                progress_cb=progress_cb,
             )
             if resampled is not None:
                 return resampled
             if sparse_candidate is not None:
                 return sparse_candidate.reset_index(drop=True)
+            if stale_candidate is not None:
+                raise RuntimeError("all_sources_stale")
             raise RuntimeError(" | ".join(errors))
 
         try:
+            self._emit_progress(progress_cb, 34, f"网络任务: 新浪日线 {prefixed_symbol} 任务55%")
             df = self._fetch_stock_daily_sina_safe(
                 symbol=prefixed_symbol,
                 start_date=start_date,
                 end_date=end_date,
                 adjust="qfq",
+                progress_cb=progress_cb,
             )
             if not self._is_sparse_result(df, span_days, minute_mode=False):
-                if self._is_valid_daily_series(df, span_days):
+                if self._is_daily_tail_stale(df, end_date=end_date):
+                    stale_candidate = df
+                    errors.append("sina:stale_tail")
+                elif self._is_valid_daily_series(df, span_days):
                     return df
-                sparse_candidate = df
-                errors.append("sina:low_density")
+                else:
+                    sparse_candidate = df
+                    errors.append("sina:low_density")
             else:
                 sparse_candidate = df
                 errors.append("sina:sparse_result")
@@ -618,17 +657,23 @@ class DataService:
             errors.append(f"sina:{exc}")
 
         try:
+            self._emit_progress(progress_cb, 36, f"网络任务: 腾讯日线 {prefixed_symbol} 任务85%")
             df_tx = self._fetch_stock_daily_tx_safe(
                 symbol=prefixed_symbol,
                 start_date=start_date,
                 end_date=end_date,
                 adjust="qfq",
+                progress_cb=progress_cb,
             )
             if not self._is_sparse_result(df_tx, span_days, minute_mode=False):
-                if self._is_valid_daily_series(df_tx, span_days):
+                if self._is_daily_tail_stale(df_tx, end_date=end_date):
+                    stale_candidate = df_tx
+                    errors.append("tencent:stale_tail")
+                elif self._is_valid_daily_series(df_tx, span_days):
                     return df_tx
-                sparse_candidate = df_tx
-                errors.append("tencent:low_density")
+                else:
+                    sparse_candidate = df_tx
+                    errors.append("tencent:low_density")
             else:
                 sparse_candidate = df_tx
                 errors.append("tencent:sparse_result")
@@ -639,6 +684,8 @@ class DataService:
 
         if sparse_candidate is not None:
             return sparse_candidate.reset_index(drop=True)
+        if stale_candidate is not None:
+            raise RuntimeError("all_sources_stale")
         raise RuntimeError(" | ".join(errors))
 
     def _fetch_stock_daily_sina_safe(
@@ -648,9 +695,11 @@ class DataService:
         start_date: str,
         end_date: str,
         adjust: str = "qfq",
+        progress_cb: Callable[[int, str], None] | None = None,
     ) -> pd.DataFrame:
         errors: list[str] = []
         try:
+            self._emit_progress(progress_cb, 36, f"网络任务: 新浪区间 {start_date}-{end_date} 任务60%")
             df = ak.stock_zh_a_daily(
                 symbol=symbol,
                 start_date=self._as_dash_date(start_date),
@@ -665,6 +714,7 @@ class DataService:
 
         # Sina occasionally fails while slicing by date; full fetch + local filter is more resilient.
         try:
+            self._emit_progress(progress_cb, 36, "网络任务: 新浪全量回退 任务70%")
             df_all = ak.stock_zh_a_daily(symbol=symbol, adjust=adjust)
             filtered = self._filter_by_date(df_all, start_date, end_date)
             if filtered is not None and not filtered.empty:
@@ -683,9 +733,11 @@ class DataService:
         start_date: str,
         end_date: str,
         adjust: str = "qfq",
+        progress_cb: Callable[[int, str], None] | None = None,
     ) -> pd.DataFrame:
         errors: list[str] = []
         try:
+            self._emit_progress(progress_cb, 36, f"网络任务: 腾讯区间 {start_date}-{end_date} 任务88%")
             df = ak.stock_zh_a_hist_tx(
                 symbol=symbol,
                 start_date=start_date,
@@ -701,6 +753,7 @@ class DataService:
         # Some symbols intermittently fail when TX does internal date slicing.
         # Fallback to full fetch and filter locally.
         try:
+            self._emit_progress(progress_cb, 36, "网络任务: 腾讯全量回退 任务94%")
             df_all = ak.stock_zh_a_hist_tx(symbol=symbol, adjust=adjust)
             filtered = self._filter_by_date(df_all, start_date, end_date)
             if filtered is not None and not filtered.empty:
@@ -718,13 +771,16 @@ class DataService:
         start_date: str,
         end_date: str,
         period: str = "daily",
+        progress_cb: Callable[[int, str], None] | None = None,
     ) -> pd.DataFrame:
         prefixed_symbol = self._normalize_index_symbol(symbol)
         errors: list[str] = []
         span_days = self._range_span_days(start_date, end_date, minute_mode=False)
         sparse_candidate: pd.DataFrame | None = None
+        stale_candidate: pd.DataFrame | None = None
 
         try:
+            self._emit_progress(progress_cb, 32, f"网络任务: 东财指数 {symbol} 任务15%")
             df = ak.index_zh_a_hist(
                 symbol=symbol,
                 period=period,
@@ -732,10 +788,16 @@ class DataService:
                 end_date=end_date,
             )
             if not self._is_sparse_result(df, span_days, minute_mode=False):
-                if period != "daily" or self._is_valid_daily_series(df, span_days):
+                if self._is_series_tail_stale(df, end_date=end_date, period=period):
+                    stale_candidate = df
+                    errors.append("eastmoney:stale_tail")
+                elif period != "daily":
                     return df
-                sparse_candidate = df
-                errors.append("eastmoney:low_density")
+                elif self._is_valid_daily_series(df, span_days):
+                    return df
+                else:
+                    sparse_candidate = df
+                    errors.append("eastmoney:low_density")
             else:
                 sparse_candidate = df
                 errors.append("eastmoney:sparse_result")
@@ -775,21 +837,29 @@ class DataService:
                     ),
                 ],
                 errors=errors,
+                progress_cb=progress_cb,
             )
             if resampled is not None:
                 return resampled
             if sparse_candidate is not None:
                 return sparse_candidate.reset_index(drop=True)
+            if stale_candidate is not None:
+                raise RuntimeError("all_sources_stale")
             raise RuntimeError(" | ".join(errors))
 
         try:
+            self._emit_progress(progress_cb, 34, f"网络任务: 新浪指数 {prefixed_symbol} 任务55%")
             df = ak.stock_zh_index_daily(symbol=prefixed_symbol)
             filtered = self._filter_by_date(df, start_date, end_date)
             if not self._is_sparse_result(filtered, span_days, minute_mode=False):
-                if self._is_valid_daily_series(filtered, span_days):
+                if self._is_series_tail_stale(filtered, end_date=end_date, period=period):
+                    stale_candidate = filtered
+                    errors.append("sina:stale_tail")
+                elif self._is_valid_daily_series(filtered, span_days):
                     return filtered
-                sparse_candidate = filtered
-                errors.append("sina:low_density")
+                else:
+                    sparse_candidate = filtered
+                    errors.append("sina:low_density")
             else:
                 sparse_candidate = filtered
                 errors.append("sina:sparse_result")
@@ -799,13 +869,18 @@ class DataService:
             errors.append(f"sina:{exc}")
 
         try:
+            self._emit_progress(progress_cb, 36, f"网络任务: 腾讯指数 {prefixed_symbol} 任务85%")
             df_tx = ak.stock_zh_index_daily_tx(symbol=prefixed_symbol)
             filtered_tx = self._filter_by_date(df_tx, start_date, end_date)
             if not self._is_sparse_result(filtered_tx, span_days, minute_mode=False):
-                if self._is_valid_daily_series(filtered_tx, span_days):
+                if self._is_series_tail_stale(filtered_tx, end_date=end_date, period=period):
+                    stale_candidate = filtered_tx
+                    errors.append("tencent:stale_tail")
+                elif self._is_valid_daily_series(filtered_tx, span_days):
                     return filtered_tx
-                sparse_candidate = filtered_tx
-                errors.append("tencent:low_density")
+                else:
+                    sparse_candidate = filtered_tx
+                    errors.append("tencent:low_density")
             else:
                 sparse_candidate = filtered_tx
                 errors.append("tencent:sparse_result")
@@ -816,6 +891,8 @@ class DataService:
 
         if sparse_candidate is not None:
             return sparse_candidate.reset_index(drop=True)
+        if stale_candidate is not None:
+            raise RuntimeError("all_sources_stale")
         raise RuntimeError(" | ".join(errors))
 
     def _fetch_stock_minute(
@@ -998,14 +1075,31 @@ class DataService:
         action_name: str,
         retries: int = 3,
         delay_seconds: float = 0.8,
+        progress_cb: Callable[[int, str], None] | None = None,
+        progress_percent: int | None = None,
+        task_label: str = "任务",
     ) -> pd.DataFrame:
         last_error: Exception | None = None
         for attempt in range(1, retries + 1):
             try:
+                if progress_cb is not None and progress_percent is not None:
+                    start_pct = int(((attempt - 1) / max(1, retries)) * 100)
+                    DataService._emit_progress(
+                        progress_cb,
+                        progress_percent,
+                        f"{task_label} 任务{start_pct}%",
+                    )
                 return fetch_func()
             except RequestException as exc:
                 last_error = exc
                 if attempt < retries:
+                    if progress_cb is not None and progress_percent is not None:
+                        retry_pct = int((attempt / max(1, retries)) * 100)
+                        DataService._emit_progress(
+                            progress_cb,
+                            progress_percent,
+                            f"{task_label} 重试{attempt + 1}/{retries} 任务{retry_pct}%",
+                        )
                     time.sleep(delay_seconds * attempt)
                     continue
                 raise RuntimeError(
@@ -1014,6 +1108,13 @@ class DataService:
             except Exception as exc:
                 last_error = exc
                 if attempt < retries:
+                    if progress_cb is not None and progress_percent is not None:
+                        retry_pct = int((attempt / max(1, retries)) * 100)
+                        DataService._emit_progress(
+                            progress_cb,
+                            progress_percent,
+                            f"{task_label} 重试{attempt + 1}/{retries} 任务{retry_pct}%",
+                        )
                     time.sleep(delay_seconds * attempt)
                     continue
                 raise RuntimeError(
@@ -1202,7 +1303,12 @@ class DataService:
     @classmethod
     def _clip_end_for_period(cls, end_value: str, *, period: str) -> str:
         if period == "daily":
-            return end_value
+            end_ts = pd.to_datetime(end_value, format="%Y%m%d", errors="coerce")
+            checkpoint_ts = pd.to_datetime(cls._daily_checkpoint(), format="%Y%m%d", errors="coerce")
+            if pd.isna(end_ts) or pd.isna(checkpoint_ts):
+                return end_value
+            clipped = min(pd.Timestamp(end_ts).normalize(), pd.Timestamp(checkpoint_ts).normalize())
+            return clipped.strftime("%Y%m%d")
         end_ts = pd.to_datetime(end_value, format="%Y%m%d", errors="coerce")
         if pd.isna(end_ts):
             return end_value
@@ -1467,6 +1573,45 @@ class DataService:
         return True
 
     @classmethod
+    def _is_daily_tail_stale(cls, df: pd.DataFrame, *, end_date: str, grace_days: int = 15) -> bool:
+        return cls._is_series_tail_stale(df, end_date=end_date, period="daily", grace_days=grace_days)
+
+    @classmethod
+    def _tail_staleness_grace_days(cls, period: str) -> int:
+        mode = cls._normalize_period(period)
+        if mode == "monthly":
+            return 62
+        if mode == "weekly":
+            return 21
+        return 15
+
+    @classmethod
+    def _is_series_tail_stale(
+        cls,
+        df: pd.DataFrame,
+        *,
+        end_date: str,
+        period: str,
+        grace_days: int | None = None,
+    ) -> bool:
+        if df is None or df.empty:
+            return True
+        _, ts = cls._extract_ts(df)
+        if ts is None:
+            # If no parsable date column exists, do not block this source.
+            return False
+        ts_clean = ts.dropna()
+        if ts_clean.empty:
+            return True
+        end_ts = pd.to_datetime(end_date, format="%Y%m%d", errors="coerce")
+        if pd.isna(end_ts):
+            return False
+        tail_ts = pd.Timestamp(ts_clean.max()).normalize()
+        target_ts = pd.Timestamp(end_ts).normalize()
+        grace = cls._tail_staleness_grace_days(period) if grace_days is None else max(1, int(grace_days))
+        return (target_ts - tail_ts) > pd.Timedelta(days=grace)
+
+    @classmethod
     def _effective_start_for_cached_non_minute(cls, start_value: str, cached_df: pd.DataFrame) -> str:
         _, ts = cls._extract_ts(cached_df)
         if ts is None or ts.dropna().empty:
@@ -1487,9 +1632,11 @@ class DataService:
         end_date: str,
         loaders: list[tuple[str, Callable[[], pd.DataFrame]]],
         errors: list[str],
+        progress_cb: Callable[[int, str], None] | None = None,
     ) -> pd.DataFrame | None:
         for source, loader in loaders:
             try:
+                self._emit_progress(progress_cb, 36, f"网络任务: {source} 重采样{period}")
                 daily_df = loader()
                 daily_filtered = self._filter_by_date(daily_df, start_date, end_date)
                 if daily_filtered is None or daily_filtered.empty:
@@ -1497,6 +1644,9 @@ class DataService:
                     continue
                 resampled = self._resample_daily_to_period(daily_filtered, period=period)
                 if resampled is not None and not resampled.empty:
+                    if self._is_series_tail_stale(resampled, end_date=end_date, period=period):
+                        errors.append(f"{source}:stale_tail")
+                        continue
                     return resampled
                 errors.append(f"{source}:resample_empty")
             except Exception as exc:
