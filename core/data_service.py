@@ -572,10 +572,19 @@ class DataService:
                     ),
                     (
                         "sina",
-                        lambda: ak.stock_zh_a_daily(
+                        lambda: self._fetch_stock_daily_sina_safe(
                             symbol=prefixed_symbol,
-                            start_date=self._as_dash_date(start_date),
-                            end_date=self._as_dash_date(end_date),
+                            start_date=start_date,
+                            end_date=end_date,
+                            adjust="qfq",
+                        ),
+                    ),
+                    (
+                        "tencent",
+                        lambda: self._fetch_stock_daily_tx_safe(
+                            symbol=prefixed_symbol,
+                            start_date=start_date,
+                            end_date=end_date,
                             adjust="qfq",
                         ),
                     ),
@@ -589,10 +598,10 @@ class DataService:
             raise RuntimeError(" | ".join(errors))
 
         try:
-            df = ak.stock_zh_a_daily(
+            df = self._fetch_stock_daily_sina_safe(
                 symbol=prefixed_symbol,
-                start_date=self._as_dash_date(start_date),
-                end_date=self._as_dash_date(end_date),
+                start_date=start_date,
+                end_date=end_date,
                 adjust="qfq",
             )
             if not self._is_sparse_result(df, span_days, minute_mode=False):
@@ -608,8 +617,99 @@ class DataService:
         except Exception as exc:
             errors.append(f"sina:{exc}")
 
+        try:
+            df_tx = self._fetch_stock_daily_tx_safe(
+                symbol=prefixed_symbol,
+                start_date=start_date,
+                end_date=end_date,
+                adjust="qfq",
+            )
+            if not self._is_sparse_result(df_tx, span_days, minute_mode=False):
+                if self._is_valid_daily_series(df_tx, span_days):
+                    return df_tx
+                sparse_candidate = df_tx
+                errors.append("tencent:low_density")
+            else:
+                sparse_candidate = df_tx
+                errors.append("tencent:sparse_result")
+                if span_days is not None and span_days <= 3:
+                    return sparse_candidate.reset_index(drop=True)
+        except Exception as exc:
+            errors.append(f"tencent:{exc}")
+
         if sparse_candidate is not None:
             return sparse_candidate.reset_index(drop=True)
+        raise RuntimeError(" | ".join(errors))
+
+    def _fetch_stock_daily_sina_safe(
+        self,
+        *,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        adjust: str = "qfq",
+    ) -> pd.DataFrame:
+        errors: list[str] = []
+        try:
+            df = ak.stock_zh_a_daily(
+                symbol=symbol,
+                start_date=self._as_dash_date(start_date),
+                end_date=self._as_dash_date(end_date),
+                adjust=adjust,
+            )
+            if df is not None and not df.empty:
+                return df
+            errors.append("empty_range")
+        except Exception as exc:
+            errors.append(str(exc))
+
+        # Sina occasionally fails while slicing by date; full fetch + local filter is more resilient.
+        try:
+            df_all = ak.stock_zh_a_daily(symbol=symbol, adjust=adjust)
+            filtered = self._filter_by_date(df_all, start_date, end_date)
+            if filtered is not None and not filtered.empty:
+                return filtered
+            if df_all is not None and not df_all.empty:
+                return df_all
+            errors.append("empty_full")
+        except Exception as exc:
+            errors.append(str(exc))
+        raise RuntimeError(" | ".join(errors))
+
+    def _fetch_stock_daily_tx_safe(
+        self,
+        *,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        adjust: str = "qfq",
+    ) -> pd.DataFrame:
+        errors: list[str] = []
+        try:
+            df = ak.stock_zh_a_hist_tx(
+                symbol=symbol,
+                start_date=start_date,
+                end_date=end_date,
+                adjust=adjust,
+            )
+            if df is not None and not df.empty:
+                return df
+            errors.append("empty_range")
+        except Exception as exc:
+            errors.append(str(exc))
+
+        # Some symbols intermittently fail when TX does internal date slicing.
+        # Fallback to full fetch and filter locally.
+        try:
+            df_all = ak.stock_zh_a_hist_tx(symbol=symbol, adjust=adjust)
+            filtered = self._filter_by_date(df_all, start_date, end_date)
+            if filtered is not None and not filtered.empty:
+                return filtered
+            if df_all is not None and not df_all.empty:
+                return df_all
+            errors.append("empty_full")
+        except Exception as exc:
+            errors.append(str(exc))
         raise RuntimeError(" | ".join(errors))
 
     def _fetch_index_daily_fallback(
@@ -1353,17 +1453,12 @@ class DataService:
             return rows >= 20
 
         density = rows / observed_days
-        max_gap = int(ts.diff().dt.days.max() or 0)
 
         if observed_days >= 365 * 3:
             if density < 0.35:
                 return False
-            if max_gap > 45:
-                return False
         elif observed_days >= 365 * 2:
             if density < 0.30:
-                return False
-            if max_gap > 60:
                 return False
 
         # Requested window may be much larger than listing age; avoid false invalidation.

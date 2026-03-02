@@ -11,7 +11,7 @@ from pathlib import Path
 import akshare as ak
 import pandas as pd
 from PySide6.QtCore import QDate, QLocale, QPoint, Qt, QThread, QTime, QSignalBlocker, Signal, QStringListModel
-from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QShortcut, QTextCharFormat
+from PySide6.QtGui import QBrush, QColor, QFont, QIcon, QKeySequence, QShortcut, QTextCharFormat
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -24,14 +24,13 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QListView,
-    QListWidget,
-    QListWidgetItem,
     QLineEdit,
     QMenu,
     QMainWindow,
     QMessageBox,
     QPushButton,
     QProgressBar,
+    QHeaderView,
     QScrollArea,
     QStackedWidget,
     QTabWidget,
@@ -60,6 +59,7 @@ class MainWindow(QMainWindow):
     symbol_data_loaded = Signal(object, object)
     sector_data_loaded = Signal(str, object, object)
     market_extension_loaded = Signal(str, object)
+    watch_spot_loaded = Signal(object, object)
 
     DATASETS = DATASET_OPTIONS
     NAV_WIDTH = 68
@@ -109,6 +109,15 @@ class MainWindow(QMainWindow):
         self._help_right_md_path = self._project_root / "docs" / "help_usage.md"
         self._market_mem_cache_key: tuple[str, str, str, str, str] | None = None
         self._market_mem_cache_response: FetchResponse | None = None
+        self._watch_spot_cache: dict[str, dict[str, object]] = {}
+        self._watch_spot_cache_ts = 0.0
+        self._watch_spot_loading = False
+        watch_cache_dir = self._cache_root / "watch"
+        watch_cache_dir.mkdir(parents=True, exist_ok=True)
+        self._watch_spot_snapshot_file = watch_cache_dir / "spot_snapshot.json"
+        self._watch_manual_width_cols: set[int] = set()
+        self._watch_resizing_columns = False
+        self._load_watch_spot_snapshot()
         market_cache_dir = self._cache_root / "market"
         market_cache_dir.mkdir(parents=True, exist_ok=True)
         self._trade_dates_parquet = market_cache_dir / "trade_dates.parquet"
@@ -116,6 +125,7 @@ class MainWindow(QMainWindow):
         self.symbol_data_loaded.connect(self._on_symbol_data_loaded)
         self.sector_data_loaded.connect(self._on_sector_data_loaded)
         self.market_extension_loaded.connect(self._on_market_extension_loaded)
+        self.watch_spot_loaded.connect(self._on_watch_spot_loaded)
         self._build_ui()
         self._apply_style()
         self._bind_shortcuts()
@@ -433,9 +443,23 @@ class MainWindow(QMainWindow):
         watch_card_layout = QVBoxLayout(watch_card)
         watch_card_layout.setContentsMargins(8, 8, 8, 8)
         watch_card_layout.setSpacing(0)
-        self.watch_list = QListWidget()
-        self.watch_list.setObjectName("watchList")
-        self.watch_list.itemDoubleClicked.connect(self._on_watch_item_activated)
+        self.watch_list = QTableWidget()
+        self.watch_list.setObjectName("watchListTable")
+        self.watch_list.setColumnCount(8)
+        self.watch_list.setHorizontalHeaderLabels(["序号", "证券代码", "证券名称", "现价", "涨幅%", "涨跌", "涨速%", "换手%"])
+        self.watch_list.setAlternatingRowColors(True)
+        self.watch_list.setSortingEnabled(False)
+        self.watch_list.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.watch_list.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.watch_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.watch_list.verticalHeader().setVisible(False)
+        watch_header = self.watch_list.horizontalHeader()
+        watch_header.setStretchLastSection(False)
+        watch_header.setSectionsMovable(False)
+        watch_header.setDefaultAlignment(Qt.AlignCenter)
+        watch_header.setSectionResizeMode(QHeaderView.Interactive)
+        watch_header.sectionResized.connect(self._on_watch_header_resized)
+        self.watch_list.cellDoubleClicked.connect(self._on_watch_item_activated)
         self.watch_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.watch_list.customContextMenuRequested.connect(self._on_watch_list_context_menu)
         watch_card_layout.addWidget(self.watch_list, 1)
@@ -848,6 +872,8 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
         self._position_floating_pod()
+        if hasattr(self, "watch_list") and self.right_pages.currentIndex() == self.RIGHT_PAGE_WATCH:
+            self._autosize_watch_columns()
 
     def _refresh_dataset_hint(self) -> None:
         option = self._current_dataset_option()
@@ -1081,6 +1107,7 @@ class MainWindow(QMainWindow):
         self._set_left_aux_visible(index != self.PAGE_WATCH)
         if index == self.PAGE_WATCH:
             self.right_pages.setCurrentIndex(self.RIGHT_PAGE_WATCH)
+            self._ensure_watch_spot_loaded()
         elif index == self.PAGE_MARKET:
             self.right_pages.setCurrentIndex(self.RIGHT_PAGE_MARKET)
         elif index == self.PAGE_HELP:
@@ -1125,13 +1152,462 @@ class MainWindow(QMainWindow):
             self._append_log(f"自选列表保存失败: {exc}")
 
     def _refresh_watchlist_view(self) -> None:
-        self.watch_list.clear()
-        for symbol in self._watchlist:
+        self.watch_list.setRowCount(len(self._watchlist))
+        for row, symbol in enumerate(self._watchlist, start=1):
             name = self._symbol_code_to_name.get(symbol, "")
-            label = f"{symbol}  {name}" if name else symbol
-            item = QListWidgetItem(label)
-            item.setData(Qt.UserRole, symbol)
-            self.watch_list.addItem(item)
+            self.watch_list.setItem(row - 1, 0, self._make_watch_item(str(row), align=Qt.AlignCenter))
+            self.watch_list.setItem(row - 1, 1, self._make_watch_item(symbol))
+            self.watch_list.setItem(row - 1, 2, self._make_watch_item(name or "--"))
+            for col in (3, 4, 5, 6, 7):
+                self.watch_list.setItem(row - 1, col, self._make_watch_item("--", align=Qt.AlignRight | Qt.AlignVCenter))
+        self._autosize_watch_columns()
+        self._ensure_watch_spot_loaded()
+
+    def _ensure_watch_spot_loaded(self, *, force: bool = False) -> None:
+        if not self._watchlist:
+            return
+        if self._watch_spot_loading:
+            return
+        cache_covers_all = bool(self._watch_spot_cache) and all(
+            code in self._watch_spot_cache for code in self._watchlist
+        )
+        cache_missing_key_metrics = any(
+            (code not in self._watch_spot_cache)
+            or (self._watch_spot_cache.get(code, {}).get("speed") is None)
+            or (self._watch_spot_cache.get(code, {}).get("turnover") is None)
+            for code in self._watchlist
+        )
+        if self._watch_spot_cache:
+            self._apply_watch_spot_data(self._watch_spot_cache)
+            if (
+                not force
+                and cache_covers_all
+                and (not cache_missing_key_metrics)
+                and (time.time() - self._watch_spot_cache_ts) <= 90
+            ):
+                return
+        if not force and (not cache_missing_key_metrics) and (time.time() - self._watch_spot_cache_ts) <= 15:
+            return
+        self._watch_spot_loading = True
+        threading.Thread(target=self._load_watch_spot_async, daemon=True).start()
+
+    def _load_watch_spot_async(self) -> None:
+        data: dict[str, dict[str, object]] | None = None
+        error: str | None = None
+        issues: list[str] = []
+        watch_codes = set(self._watchlist)
+        # Fast path first: per-symbol fallback usually returns quickly for a small watchlist.
+        data = self._load_watch_spot_fallback_by_symbol(list(watch_codes))
+
+        df, spot_err = self._run_with_timeout(lambda: ak.stock_zh_a_spot_em(), timeout_seconds=8.0)
+        if spot_err is not None:
+            issues.append(f"spot_em:{spot_err}")
+        if isinstance(df, pd.DataFrame):
+            try:
+                code_col = self._pick_column(df, ("代码", "证券代码", "symbol"))
+                if code_col is None:
+                    raise RuntimeError("缺少代码列")
+                name_col = self._pick_column(df, ("名称", "证券名称", "name"))
+                price_col = self._pick_column(df, ("最新价", "现价", "price", "last"))
+                pct_col = self._pick_column(df, ("涨跌幅", "pct_chg", "change_percent"))
+                chg_col = self._pick_column(df, ("涨跌额", "涨跌", "change", "change_amount"))
+                speed_col = self._pick_column(df, ("涨速", "涨速%", "speed", "change_speed", "change_speed_pct"))
+                turn_col = self._pick_column(df, ("换手率", "换手", "换手率(%)", "turnover", "turnover_rate", "turnover_ratio"))
+                if data is None:
+                    data = {}
+                for _, row in df.iterrows():
+                    code = str(row.get(code_col, "")).strip().replace(".0", "")
+                    if code.isdigit():
+                        code = code.zfill(6)
+                    if code not in watch_codes:
+                        continue
+                    existing = data.get(code, {})
+                    name_val = str(row.get(name_col, "")).strip() if name_col else str(existing.get("name", "") or "")
+                    price_val = self._to_float(row.get(price_col)) if price_col else None
+                    pct_val = self._to_float(row.get(pct_col)) if pct_col else None
+                    chg_val = self._to_float(row.get(chg_col)) if chg_col else None
+                    speed_val = self._to_float(row.get(speed_col)) if speed_col else None
+                    turnover_val = self._to_float(row.get(turn_col)) if turn_col else None
+                    data[code] = {
+                        "name": name_val or str(existing.get("name", "") or ""),
+                        "price": price_val if price_val is not None else existing.get("price"),
+                        "pct": pct_val if pct_val is not None else existing.get("pct"),
+                        "chg": chg_val if chg_val is not None else existing.get("chg"),
+                        "speed": speed_val if speed_val is not None else existing.get("speed"),
+                        "turnover": turnover_val if turnover_val is not None else existing.get("turnover"),
+                    }
+            except Exception as exc:
+                issues.append(f"spot_em_parse:{exc}")
+        else:
+            # Fallback: sina full market spot; does not include turnover/speed, but can refresh price/pct/chg.
+            sina_df, sina_err = self._run_with_timeout(lambda: ak.stock_zh_a_spot(), timeout_seconds=8.0)
+            if sina_err is not None:
+                issues.append(f"spot_sina:{sina_err}")
+            elif isinstance(sina_df, pd.DataFrame):
+                try:
+                    code_col = self._pick_column(sina_df, ("代码", "symbol"))
+                    name_col = self._pick_column(sina_df, ("名称", "name"))
+                    price_col = self._pick_column(sina_df, ("最新价", "price", "last"))
+                    pct_col = self._pick_column(sina_df, ("涨跌幅", "pct_chg", "change_percent"))
+                    chg_col = self._pick_column(sina_df, ("涨跌额", "涨跌", "change", "change_amount"))
+                    if code_col is not None:
+                        if data is None:
+                            data = {}
+                        for _, row in sina_df.iterrows():
+                            code = str(row.get(code_col, "")).strip().replace(".0", "")
+                            if code.isdigit():
+                                code = code.zfill(6)
+                            if code not in watch_codes:
+                                continue
+                            payload = data.get(code, {})
+                            payload.update(
+                                {
+                                    "name": str(row.get(name_col, "")).strip() if name_col else payload.get("name", ""),
+                                    "price": self._to_float(row.get(price_col)) if price_col else payload.get("price"),
+                                    "pct": self._to_float(row.get(pct_col)) if pct_col else payload.get("pct"),
+                                    "chg": self._to_float(row.get(chg_col)) if chg_col else payload.get("chg"),
+                                }
+                            )
+                            data[code] = payload
+                except Exception as exc:
+                    issues.append(f"spot_sina_parse:{exc}")
+
+        missing = [c for c in self._watchlist if not data or c not in data]
+        if missing:
+            fallback = self._load_watch_spot_fallback_by_symbol(missing)
+            if fallback:
+                if data is None:
+                    data = {}
+                data.update(fallback)
+
+        if not data:
+            if issues:
+                error = " | ".join(issues)
+            else:
+                error = "自选行情数据为空"
+        self.watch_spot_loaded.emit(data, error)
+
+    @staticmethod
+    def _run_with_timeout(callable_obj, timeout_seconds: float) -> tuple[object | None, str | None]:
+        result: dict[str, object] = {}
+        error: dict[str, str] = {}
+
+        def _runner() -> None:
+            try:
+                result["value"] = callable_obj()
+            except Exception as exc:
+                error["message"] = str(exc)
+
+        worker = threading.Thread(target=_runner, daemon=True)
+        worker.start()
+        worker.join(timeout=max(0.1, float(timeout_seconds)))
+        if worker.is_alive():
+            return None, "timeout"
+        if "message" in error:
+            return None, error["message"]
+        return result.get("value"), None
+
+    def _on_watch_spot_loaded(self, data: object, error: object) -> None:
+        self._watch_spot_loading = False
+        if error:
+            self._append_log(f"自选行情更新失败: {error}")
+            return
+        spot = data if isinstance(data, dict) else {}
+        prev_spot = dict(self._watch_spot_cache)
+        prev_ts = float(self._watch_spot_cache_ts or 0.0)
+        now_ts = time.time()
+        # If realtime source misses speed, estimate from last cached price delta per minute.
+        if prev_spot and prev_ts > 0:
+            dt = max(1.0, now_ts - prev_ts)
+            for code, payload in spot.items():
+                if payload.get("speed") is not None:
+                    continue
+                cur = self._to_float(payload.get("price"))
+                prev = self._to_float(prev_spot.get(code, {}).get("price"))
+                if cur is None or prev in (None, 0):
+                    continue
+                payload["speed"] = (cur - float(prev)) / float(prev) * 100 * 60.0 / dt
+                if payload.get("turnover") is None:
+                    payload["turnover"] = prev_spot.get(code, {}).get("turnover")
+        self._watch_spot_cache = spot
+        self._watch_spot_cache_ts = now_ts
+        self._save_watch_spot_snapshot(spot, self._watch_spot_cache_ts)
+        self._apply_watch_spot_data(spot)
+
+    def _apply_watch_spot_data(self, spot: dict[str, dict[str, object]]) -> None:
+        for row, symbol in enumerate(self._watchlist):
+            payload = spot.get(symbol, {})
+            name = str(payload.get("name", "") or self._symbol_code_to_name.get(symbol, "") or "--")
+            self.watch_list.setItem(row, 2, self._make_watch_item(name))
+            self.watch_list.setItem(row, 3, self._make_watch_item(self._format_watch_value(payload.get("price")), align=Qt.AlignRight | Qt.AlignVCenter))
+            self.watch_list.setItem(row, 4, self._make_watch_item(self._format_watch_value(payload.get("pct"), signed=True), align=Qt.AlignRight | Qt.AlignVCenter, color=self._watch_signed_color(payload.get("pct"))))
+            self.watch_list.setItem(row, 5, self._make_watch_item(self._format_watch_value(payload.get("chg"), signed=True), align=Qt.AlignRight | Qt.AlignVCenter, color=self._watch_signed_color(payload.get("chg"))))
+            self.watch_list.setItem(row, 6, self._make_watch_item(self._format_watch_value(payload.get("speed"), signed=True), align=Qt.AlignRight | Qt.AlignVCenter, color=self._watch_signed_color(payload.get("speed"))))
+            self.watch_list.setItem(row, 7, self._make_watch_item(self._format_watch_value(payload.get("turnover")), align=Qt.AlignRight | Qt.AlignVCenter))
+        self._autosize_watch_columns()
+
+    def _load_watch_spot_fallback_by_symbol(self, symbols: list[str]) -> dict[str, dict[str, object]]:
+        out: dict[str, dict[str, object]] = {}
+        end_date = QDate.currentDate().toString("yyyyMMdd")
+        start_date = QDate.currentDate().addDays(-40).toString("yyyyMMdd")
+        for code in symbols:
+            payload = self._fetch_single_watch_fallback(code, start_date, end_date)
+            if payload is not None:
+                out[code] = payload
+        return out
+
+    def _fetch_single_watch_fallback(self, code: str, start_date: str, end_date: str) -> dict[str, object] | None:
+        quote = self._normalize_a_quote_symbol(code)
+        turnover_val: float | None = None
+        speed_val: float | None = None
+
+        # Try to get turnover from recent daily bars (eastmoney often carries 换手率).
+        try:
+            df_turn = ak.stock_zh_a_hist(
+                symbol=code,
+                period="daily",
+                start_date=start_date,
+                end_date=end_date,
+                adjust="qfq",
+            )
+            turn_col = self._pick_column(df_turn, ("换手率", "换手", "换手率(%)", "turnover", "turnover_rate", "turnover_ratio"))
+            if turn_col is not None and not df_turn.empty:
+                turnover_val = self._to_float(df_turn.iloc[-1][turn_col])
+        except Exception:
+            pass
+
+        # Approximate speed by latest minute-to-minute change when available.
+        try:
+            end_qdate = QDate.fromString(end_date, "yyyyMMdd")
+            if not end_qdate.isValid():
+                end_qdate = QDate.currentDate()
+            start_qdate = end_qdate.addDays(-1)
+            min_df = ak.stock_zh_a_hist_min_em(
+                symbol=code,
+                start_date=f"{start_qdate.toString('yyyy-MM-dd')} 09:30:00",
+                end_date=f"{end_qdate.toString('yyyy-MM-dd')} 15:00:00",
+                period="1",
+                adjust="",
+            )
+            if min_df is not None and len(min_df.index) >= 2:
+                close_col = self._pick_column(min_df, ("收盘", "最新价", "close", "price"))
+                if close_col is not None:
+                    close_vals = pd.to_numeric(min_df[close_col], errors="coerce").dropna()
+                    if len(close_vals.index) >= 2 and float(close_vals.iloc[-2]) != 0:
+                        speed_val = (float(close_vals.iloc[-1]) - float(close_vals.iloc[-2])) / float(close_vals.iloc[-2]) * 100
+        except Exception:
+            pass
+        if speed_val is None:
+            try:
+                tick_df = ak.stock_zh_a_tick_tx_js(symbol=quote)
+                price_col = self._pick_column(tick_df, ("成交价格", "price"))
+                if price_col is not None and tick_df is not None and len(tick_df.index) >= 2:
+                    prices = pd.to_numeric(tick_df[price_col], errors="coerce").dropna()
+                    if len(prices.index) >= 2 and float(prices.iloc[-2]) != 0:
+                        speed_val = (float(prices.iloc[-1]) - float(prices.iloc[-2])) / float(prices.iloc[-2]) * 100
+            except Exception:
+                pass
+
+        loaders = (
+            lambda: self._fetch_watch_sina_daily_safe(symbol=quote, start_date=start_date, end_date=end_date, adjust="qfq"),
+            lambda: ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, end_date=end_date, adjust="qfq"),
+            lambda: ak.stock_zh_a_hist_tx(symbol=quote, start_date=start_date, end_date=end_date, adjust="qfq"),
+        )
+        best_payload: dict[str, object] | None = None
+        for loader in loaders:
+            try:
+                df = loader()
+                if df is None or df.empty:
+                    continue
+                close_col = self._pick_column(df, ("收盘", "close"))
+                pct_col = self._pick_column(df, ("涨跌幅", "pct_chg", "change_percent"))
+                chg_col = self._pick_column(df, ("涨跌额", "涨跌", "change", "change_amount"))
+                turn_col = self._pick_column(df, ("换手率", "换手", "换手率(%)", "turnover", "turnover_rate", "turnover_ratio"))
+                if close_col is None:
+                    continue
+                close_series = pd.to_numeric(df[close_col], errors="coerce").dropna()
+                if close_series.empty:
+                    continue
+                last_close = float(close_series.iloc[-1])
+                prev_close = float(close_series.iloc[-2]) if len(close_series.index) >= 2 else None
+                pct_val = self._to_float(df.iloc[-1][pct_col]) if pct_col else None
+                chg_val = self._to_float(df.iloc[-1][chg_col]) if chg_col else None
+                if chg_val is None and prev_close not in (None, 0):
+                    chg_val = last_close - float(prev_close)
+                if pct_val is None and prev_close not in (None, 0):
+                    pct_val = (last_close - float(prev_close)) / float(prev_close) * 100
+                payload = {
+                    "name": self._symbol_code_to_name.get(code, ""),
+                    "price": last_close,
+                    "pct": pct_val,
+                    "chg": chg_val,
+                    "speed": speed_val,
+                    "turnover": self._to_float(df.iloc[-1][turn_col]) if turn_col else turnover_val,
+                }
+                if payload.get("turnover") is not None:
+                    return payload
+                if best_payload is None:
+                    best_payload = payload
+            except Exception:
+                continue
+        return best_payload
+
+    def _fetch_watch_sina_daily_safe(
+        self,
+        *,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        adjust: str = "qfq",
+    ) -> pd.DataFrame:
+        start_dash = self._watch_compact_to_dash_date(start_date)
+        end_dash = self._watch_compact_to_dash_date(end_date)
+        try:
+            df = ak.stock_zh_a_daily(
+                symbol=symbol,
+                start_date=start_dash,
+                end_date=end_dash,
+                adjust=adjust,
+            )
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df
+        except Exception:
+            pass
+        df_all = ak.stock_zh_a_daily(symbol=symbol, adjust=adjust)
+        if not isinstance(df_all, pd.DataFrame) or df_all.empty:
+            return pd.DataFrame()
+        filtered = self._filter_watch_daily_by_compact_date(df_all, start_date=start_date, end_date=end_date)
+        if not filtered.empty:
+            return filtered
+        return df_all
+
+    @staticmethod
+    def _watch_compact_to_dash_date(value: str) -> str:
+        text = str(value or "").strip()
+        try:
+            return datetime.strptime(text, "%Y%m%d").strftime("%Y-%m-%d")
+        except Exception:
+            return text
+
+    @staticmethod
+    def _filter_watch_daily_by_compact_date(df: pd.DataFrame, *, start_date: str, end_date: str) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        date_col = None
+        for candidate in ("date", "日期"):
+            if candidate in df.columns:
+                date_col = candidate
+                break
+        if date_col is None:
+            return pd.DataFrame()
+        series = pd.to_datetime(df[date_col], errors="coerce")
+        start = pd.to_datetime(start_date, format="%Y%m%d", errors="coerce")
+        end = pd.to_datetime(end_date, format="%Y%m%d", errors="coerce")
+        if pd.isna(start) or pd.isna(end):
+            return pd.DataFrame()
+        mask = series.between(start, end)
+        return df.loc[mask].reset_index(drop=True)
+
+    @staticmethod
+    def _normalize_a_quote_symbol(code: str) -> str:
+        raw = str(code or "").strip().lower().replace("sh", "").replace("sz", "").replace("bj", "")
+        if raw.startswith(("6", "5", "9")):
+            return f"sh{raw}"
+        if raw.startswith(("8", "4")):
+            return f"bj{raw}"
+        return f"sz{raw}"
+
+    def _load_watch_spot_snapshot(self) -> None:
+        path = self._watch_spot_snapshot_file
+        if not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            data = payload.get("data")
+            ts = payload.get("ts")
+            if isinstance(data, dict):
+                self._watch_spot_cache = data
+            if isinstance(ts, (int, float)):
+                self._watch_spot_cache_ts = float(ts)
+        except Exception:
+            self._watch_spot_cache = {}
+            self._watch_spot_cache_ts = 0.0
+
+    def _save_watch_spot_snapshot(self, data: dict[str, dict[str, object]], ts: float) -> None:
+        try:
+            payload = {"ts": float(ts), "data": data}
+            self._watch_spot_snapshot_file.write_text(
+                json.dumps(payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception:
+            return
+
+    def _autosize_watch_columns(self) -> None:
+        header = self.watch_list.horizontalHeader()
+        min_widths = {0: 52, 1: 92, 2: 132, 3: 86, 4: 84, 5: 84, 6: 84, 7: 84}
+        self._watch_resizing_columns = True
+        try:
+            for col in range(self.watch_list.columnCount()):
+                if col in self._watch_manual_width_cols:
+                    continue
+                header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+                self.watch_list.resizeColumnToContents(col)
+                width = max(self.watch_list.columnWidth(col), min_widths.get(col, 72))
+                self.watch_list.setColumnWidth(col, width)
+                header.setSectionResizeMode(col, QHeaderView.Interactive)
+            max_widths = {2: 186}
+            for col, max_width in max_widths.items():
+                if col in self._watch_manual_width_cols:
+                    continue
+                if self.watch_list.columnWidth(col) > max_width:
+                    self.watch_list.setColumnWidth(col, max_width)
+        finally:
+            self._watch_resizing_columns = False
+
+    def _on_watch_header_resized(self, logical_index: int, _old_size: int, new_size: int) -> None:
+        if self._watch_resizing_columns:
+            return
+        if new_size > 0:
+            self._watch_manual_width_cols.add(int(logical_index))
+
+    @staticmethod
+    def _format_watch_value(value: object, *, signed: bool = False) -> str:
+        if value is None:
+            return "--"
+        try:
+            num = float(value)
+            if signed:
+                sign = "+" if num > 0 else ""
+                return f"{sign}{num:.2f}"
+            return f"{num:.2f}"
+        except Exception:
+            return "--"
+
+    @staticmethod
+    def _watch_signed_color(value: object) -> str | None:
+        try:
+            v = float(value)
+        except Exception:
+            return None
+        if v > 0:
+            return "#ff4d4f"
+        if v < 0:
+            return "#47c16f"
+        return "#d8deea"
+
+    @staticmethod
+    def _make_watch_item(
+        text: str,
+        *,
+        align: Qt.AlignmentFlag = Qt.AlignLeft | Qt.AlignVCenter,
+        color: str | None = None,
+    ) -> QTableWidgetItem:
+        item = QTableWidgetItem(text)
+        item.setTextAlignment(int(align))
+        if color:
+            item.setForeground(QBrush(QColor(color)))
+        return item
 
     def _add_watch_symbol_value(self, raw: str) -> tuple[bool, str]:
         self._ensure_symbol_lookup_ready()
@@ -1147,27 +1623,33 @@ class MainWindow(QMainWindow):
         return True, symbol
 
     def _remove_selected_watch_symbol(self) -> None:
-        item = self.watch_list.currentItem()
-        if item is None:
+        row = self.watch_list.currentRow()
+        if row < 0:
             return
-        symbol = str(item.data(Qt.UserRole) or item.text().split()[0]).strip()
+        code_item = self.watch_list.item(row, 1)
+        if code_item is None:
+            return
+        symbol = str(code_item.text()).strip()
         self._watchlist = [s for s in self._watchlist if s != symbol]
         self._save_watchlist()
         self._refresh_watchlist_view()
         self._append_log(f"已移除自选: {symbol}")
 
-    def _on_watch_item_activated(self, item: QListWidgetItem) -> None:
-        symbol = str(item.data(Qt.UserRole) or item.text().split()[0]).strip()
+    def _on_watch_item_activated(self, row: int, _column: int) -> None:
+        code_item = self.watch_list.item(row, 1)
+        if code_item is None:
+            return
+        symbol = str(code_item.text()).strip()
         self._activate_watch_symbol(symbol)
 
     def _on_watch_list_context_menu(self, pos: QPoint) -> None:
         item = self.watch_list.itemAt(pos)
         if item is None:
             return
-        self.watch_list.setCurrentItem(item)
+        self.watch_list.selectRow(item.row())
         menu = QMenu(self)
         delete_action = menu.addAction("删除自选")
-        selected = menu.exec(self.watch_list.mapToGlobal(pos))
+        selected = menu.exec(self.watch_list.viewport().mapToGlobal(pos))
         if selected == delete_action:
             self._remove_selected_watch_symbol()
 
@@ -1591,6 +2073,7 @@ class MainWindow(QMainWindow):
             "时间字段格式异常（上游源格式波动）",
             text,
         )
+        text = text.replace("doesnt match format", "时间字段格式异常（上游源格式波动）")
         text = re.sub(r"[()']+", "", text)
         text = re.sub(r"\s+,", ",", text)
         text = re.sub(r"\s*\|\s*", "\n- ", text)
@@ -2780,8 +3263,29 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _to_float(value: object) -> float | None:
+        if value is None:
+            return None
         try:
-            return float(str(value).replace(",", ""))
+            if isinstance(value, (int, float)) and not pd.isna(value):
+                return float(value)
+        except Exception:
+            pass
+        try:
+            text = str(value).strip()
+            if not text or text.lower() in {"nan", "none", "null", "--", "-", "n/a"}:
+                return None
+            text = text.replace(",", "").replace("%", "")
+            scale = 1.0
+            if text.endswith("亿"):
+                scale = 1e8
+                text = text[:-1]
+            elif text.endswith("万"):
+                scale = 1e4
+                text = text[:-1]
+            elif text.endswith("千"):
+                scale = 1e3
+                text = text[:-1]
+            return float(text) * scale
         except Exception:
             return None
 

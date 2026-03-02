@@ -71,27 +71,38 @@ QPushButton#navButton:checked {
     background-color: #2a3651;
     color: #e9f1ff;
 }
-QListWidget#watchList {
-    border: none;
-    border-radius: 10px;
-    background-color: transparent;
-    color: #e8ebf4;
-    outline: 0;
-    padding: 2px;
-}
 QFrame#watchCard {
     border: 1px solid #303645;
     border-radius: 12px;
     background-color: #1b202b;
 }
-QListWidget#watchList::item {
-    min-height: 32px;
-    border-radius: 8px;
-    padding: 4px 8px;
+QTableWidget#watchListTable {
+    border: none;
+    border-radius: 10px;
+    background-color: #182238;
+    alternate-background-color: #1b2741;
+    gridline-color: #293850;
+    selection-background-color: #2f63a8;
+    selection-color: #ffffff;
 }
-QListWidget#watchList::item:selected {
-    background-color: #325a94;
-    color: #ffffff;
+QTableWidget#watchListTable QHeaderView::section {
+    background-color: #1a263c;
+    color: #9eabc1;
+    border: none;
+    border-bottom: 1px solid #2a3953;
+    border-right: 1px solid #273854;
+    padding: 6px 8px;
+    font-size: 12px;
+    font-weight: 600;
+}
+QTableWidget#watchListTable QHeaderView {
+    background-color: #1a263c;
+}
+QTableWidget#watchListTable QTableCornerButton::section {
+    background-color: #1a263c;
+    border: none;
+    border-right: 1px solid #273854;
+    border-bottom: 1px solid #2a3953;
 }
 QFrame#marketSideCard {
     background-color: #1c2029;
@@ -459,6 +470,14 @@ QTableWidget#watchResultTable QHeaderView::section, QTableWidget#analysisResultT
     border-right: 1px solid #25334f;
     padding: 6px 8px;
     font-weight: 600;
+}
+QTableWidget#analysisResultTable QHeaderView {
+    background-color: #162136;
+}
+QTableWidget#analysisResultTable QTableCornerButton::section {
+    background-color: #162136;
+    border: none;
+    border-bottom: 1px solid #2a3650;
 }
 QHeaderView::section {
     background-color: #1f232c;
