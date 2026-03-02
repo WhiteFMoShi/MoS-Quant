@@ -914,8 +914,12 @@ class DataService:
             )
             filtered = self._filter_by_datetime(df, start_date, end_date)
             if filtered is not None and not filtered.empty:
-                return filtered
-            return df
+                if self._is_minute_tail_stale(filtered, end_datetime=end_date):
+                    errors.append("eastmoney_min:stale_tail")
+                else:
+                    return filtered
+            elif df is not None and not df.empty and not self._is_minute_tail_stale(df, end_datetime=end_date):
+                return df
         except Exception as exc:
             errors.append(f"eastmoney_min:{exc}")
 
@@ -929,8 +933,12 @@ class DataService:
             )
             filtered = self._filter_by_datetime(rv, start_date, end_date)
             if filtered is not None and not filtered.empty:
-                return filtered
-            return rv
+                if self._is_minute_tail_stale(filtered, end_datetime=end_date):
+                    errors.append("eastmoney_rv:stale_tail")
+                else:
+                    return filtered
+            elif rv is not None and not rv.empty and not self._is_minute_tail_stale(rv, end_datetime=end_date):
+                return rv
         except Exception as exc:
             errors.append(f"eastmoney_rv:{exc}")
 
@@ -941,8 +949,11 @@ class DataService:
                 minute_df = minute_df.rename(columns={"day": "datetime"})
             filtered = self._filter_by_datetime(minute_df, start_date, end_date)
             if filtered is not None and not filtered.empty:
-                return filtered
-            if minute_df is not None and not minute_df.empty:
+                if self._is_minute_tail_stale(filtered, end_datetime=end_date):
+                    errors.append("sina_min:stale_tail")
+                else:
+                    return filtered
+            if minute_df is not None and not minute_df.empty and not self._is_minute_tail_stale(minute_df, end_datetime=end_date):
                 return minute_df
         except Exception as exc:
             errors.append(f"sina_min:{exc}")
@@ -973,8 +984,12 @@ class DataService:
                 )
                 filtered = self._filter_by_datetime(df, start_date, end_date)
                 if filtered is not None and not filtered.empty:
-                    return filtered
-                return df
+                    if self._is_minute_tail_stale(filtered, end_datetime=end_date):
+                        errors.append(f"index_min:{key}:stale_tail")
+                    else:
+                        return filtered
+                elif df is not None and not df.empty and not self._is_minute_tail_stale(df, end_datetime=end_date):
+                    return df
             except Exception as exc:
                 errors.append(f"index_min:{key}:{exc}")
 
@@ -985,8 +1000,11 @@ class DataService:
                 minute_df = minute_df.rename(columns={"day": "datetime"})
             filtered = self._filter_by_datetime(minute_df, start_date, end_date)
             if filtered is not None and not filtered.empty:
-                return filtered
-            if minute_df is not None and not minute_df.empty:
+                if self._is_minute_tail_stale(filtered, end_datetime=end_date):
+                    errors.append("sina_min:stale_tail")
+                else:
+                    return filtered
+            if minute_df is not None and not minute_df.empty and not self._is_minute_tail_stale(minute_df, end_datetime=end_date):
                 return minute_df
         except Exception as exc:
             errors.append(f"sina_min:{exc}")
@@ -1580,10 +1598,27 @@ class DataService:
     def _tail_staleness_grace_days(cls, period: str) -> int:
         mode = cls._normalize_period(period)
         if mode == "monthly":
-            return 62
+            return 25
         if mode == "weekly":
-            return 21
-        return 15
+            return 12
+        return 10
+
+    @classmethod
+    def _is_minute_tail_stale(cls, df: pd.DataFrame, *, end_datetime: str, grace_days: int = 3) -> bool:
+        if df is None or df.empty:
+            return True
+        _, ts = cls._extract_ts(df)
+        if ts is None:
+            return False
+        ts_clean = ts.dropna()
+        if ts_clean.empty:
+            return True
+        end_ts = pd.to_datetime(end_datetime, errors="coerce")
+        if pd.isna(end_ts):
+            return False
+        tail_ts = pd.Timestamp(ts_clean.max())
+        target_ts = pd.Timestamp(end_ts)
+        return (target_ts - tail_ts) > pd.Timedelta(days=max(1, int(grace_days)))
 
     @classmethod
     def _is_series_tail_stale(
