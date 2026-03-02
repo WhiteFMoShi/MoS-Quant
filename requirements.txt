@@ -1,0 +1,5 @@
+akshare>=1.16.90
+pandas>=2.2.0
+PySide6-Essentials>=6.7.0
+pyarrow>=17.0.0
+pyqtgraph>=0.13.7
