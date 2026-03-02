@@ -263,6 +263,9 @@ class TimeSeriesCache:
                 return False
             today = pd.Timestamp(datetime.now().date())
             end_day = end_ts.normalize()
+            # Real-time minute feeds are often 1-5 minutes behind; avoid needless re-fetch loops.
+            if end_day == today and gap <= pd.Timedelta(minutes=5):
+                return True
             # During market close (today/weekend), minute quote may stop at last close.
             if end_day > today:
                 return True
