@@ -9,6 +9,7 @@ from pathlib import Path
 import threading
 import time
 from typing import Callable
+from collections import OrderedDict
 
 import akshare as ak
 import pandas as pd
@@ -60,6 +61,44 @@ class DataService:
         self._adopt_legacy_cache_files("datasets")
         self._cleanup_obsolete_series_cache_files()
         self._ensure_trade_dates_cache_refresh()
+        self._minute_window_mem: OrderedDict[tuple[str, str, str], pd.DataFrame] = OrderedDict()
+        self._minute_window_mem_limit = 6
+
+    def _call_df_with_timeout(self, loader: Callable[[], pd.DataFrame], *, timeout_seconds: float = 12.0) -> pd.DataFrame:
+        payload: dict[str, object] = {}
+        error: dict[str, Exception] = {}
+
+        def runner() -> None:
+            try:
+                payload["df"] = loader()
+            except Exception as exc:
+                error["exc"] = exc
+
+        t = threading.Thread(target=runner, daemon=True)
+        t.start()
+        t.join(timeout=max(0.2, float(timeout_seconds)))
+        if t.is_alive():
+            raise TimeoutError("timeout")
+        if "exc" in error:
+            raise error["exc"]
+        df = payload.get("df")
+        if not isinstance(df, pd.DataFrame):
+            return pd.DataFrame()
+        return df
+
+    def _get_minute_window_cached(self, *, key: tuple[str, str, str], loader: Callable[[], pd.DataFrame]) -> pd.DataFrame:
+        cached = self._minute_window_mem.get(key)
+        if cached is not None:
+            self._minute_window_mem.move_to_end(key, last=True)
+            return cached
+        df = loader()
+        if df is None:
+            df = pd.DataFrame()
+        self._minute_window_mem[key] = df
+        self._minute_window_mem.move_to_end(key, last=True)
+        while len(self._minute_window_mem) > int(self._minute_window_mem_limit):
+            self._minute_window_mem.popitem(last=False)
+        return df
 
     def _ensure_trade_dates_cache_refresh(self) -> None:
         if DataService._TRADE_DATES_REFRESHING:
@@ -211,9 +250,22 @@ class DataService:
             "adjust": "qfq",
         }
         if self._is_minute_period(period):
-            start = self._as_datetime_text(request.start_date, start_of_day=True)
-            end = self._as_datetime_text(request.end_date, start_of_day=False)
-            end = self._clip_minute_end_by_checkpoint(end)
+            if str(request.end_date or "").strip():
+                end = self._as_datetime_text(request.end_date, start_of_day=False)
+            else:
+                checkpoint = self._minute_checkpoint_for_period(period)
+                end_ts = pd.to_datetime(checkpoint, format="%Y%m%d%H%M", errors="coerce")
+                end = (pd.Timestamp(end_ts) if not pd.isna(end_ts) else pd.Timestamp.now().floor("min")).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+            if str(request.start_date or "").strip():
+                start = self._as_datetime_text(request.start_date, start_of_day=True)
+            else:
+                start_ts = (pd.to_datetime(end, errors="coerce").normalize() - pd.Timedelta(days=self._minute_window_days(period))).replace(
+                    hour=9, minute=30, second=0
+                )
+                start = pd.Timestamp(start_ts).strftime("%Y-%m-%d %H:%M:%S")
+            end = self._clip_minute_end_by_checkpoint(end, period=period)
             start, end = self._clip_minute_range(start, end, period=period)
             title = f"{title_prefix} {symbol} {start}-{end}"
             params["start_date"] = start
@@ -331,9 +383,22 @@ class DataService:
             "period": period,
         }
         if self._is_minute_period(period):
-            start = self._as_datetime_text(request.start_date, start_of_day=True)
-            end = self._as_datetime_text(request.end_date, start_of_day=False)
-            end = self._clip_minute_end_by_checkpoint(end)
+            if str(request.end_date or "").strip():
+                end = self._as_datetime_text(request.end_date, start_of_day=False)
+            else:
+                checkpoint = self._minute_checkpoint_for_period(period)
+                end_ts = pd.to_datetime(checkpoint, format="%Y%m%d%H%M", errors="coerce")
+                end = (pd.Timestamp(end_ts) if not pd.isna(end_ts) else pd.Timestamp.now().floor("min")).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+            if str(request.start_date or "").strip():
+                start = self._as_datetime_text(request.start_date, start_of_day=True)
+            else:
+                start_ts = (pd.to_datetime(end, errors="coerce").normalize() - pd.Timedelta(days=self._minute_window_days(period))).replace(
+                    hour=9, minute=30, second=0
+                )
+                start = pd.Timestamp(start_ts).strftime("%Y-%m-%d %H:%M:%S")
+            end = self._clip_minute_end_by_checkpoint(end, period=period)
             start, end = self._clip_minute_range(start, end, period=period)
             title = f"{title_prefix} {symbol} {start}-{end}"
             params["start_date"] = start
@@ -419,6 +484,7 @@ class DataService:
         minute_mode: bool,
         progress_cb: Callable[[int, str], None] | None = None,
     ) -> FetchResponse:
+        title_out = title
         self._emit_progress(progress_cb, 4, "检查缓存")
         parquet_path, pickle_path = self._series_cache.cache_paths(params)
         cached_df = pd.DataFrame()
@@ -531,36 +597,59 @@ class DataService:
                 )
             self._emit_progress(progress_cb, 14, "执行末端增量更新")
         else:
-            ranges = self._series_cache.missing_ranges(cached_df, range_start_value, end_value, minute_mode)
-            if not ranges:
-                filtered = self._series_cache.filter_by_range(cached_df, range_start_value, end_value, minute_mode)
-                fresh_enough = self._is_result_fresh_for_request_end(
-                    filtered,
+            if minute_mode and not cached_df.empty:
+                # Minute endpoints are often window-limited and unstable; prioritise tail-only incremental
+                # to avoid repeated old-range chunk failures blocking the whole request.
+                tail_ranges = self._build_tail_update_ranges(
+                    cached_df=cached_df,
                     end_value=end_value,
-                    period=period_mode,
-                    minute_mode=minute_mode,
+                    minute_mode=True,
                 )
-                if ((not validate_daily) or self._is_valid_daily_series(filtered, span_days)) and fresh_enough:
-                    if minute_mode and not self._minute_left_coverage_ok(filtered, start_datetime=start_value):
-                        ranges_to_fetch = [(start_value, end_value)]
-                        self._emit_progress(progress_cb, 14, "缓存左侧缺口，执行全区间修复")
-                    else:
-                        self._emit_progress(progress_cb, 100, "命中缓存")
-                        return FetchResponse(
-                            title=title,
-                            dataframe=filtered,
-                            cache_path=str(
-                                cached_path
-                                if cached_path is not None
-                                else (parquet_path if parquet_path.exists() else pickle_path)
-                            ),
-                            from_cache=True,
-                        )
+                if tail_ranges:
+                    ranges_to_fetch = tail_ranges
+                    self._emit_progress(progress_cb, 14, "分钟模式: 末端增量更新")
                 else:
-                    ranges_to_fetch = [(start_value, end_value)]
-                    self._emit_progress(progress_cb, 14, "缓存完整但质量不足，执行全区间修复")
+                    filtered = self._series_cache.filter_by_range(cached_df, range_start_value, end_value, True)
+                    self._emit_progress(progress_cb, 100, "命中缓存")
+                    return FetchResponse(
+                        title=title,
+                        dataframe=filtered,
+                        cache_path=str(
+                            cached_path if cached_path is not None else (parquet_path if parquet_path.exists() else pickle_path)
+                        ),
+                        from_cache=True,
+                    )
             else:
-                ranges_to_fetch = ranges
+                ranges = self._series_cache.missing_ranges(cached_df, range_start_value, end_value, minute_mode)
+                if not ranges:
+                    filtered = self._series_cache.filter_by_range(cached_df, range_start_value, end_value, minute_mode)
+                    fresh_enough = self._is_result_fresh_for_request_end(
+                        filtered,
+                        end_value=end_value,
+                        period=period_mode,
+                        minute_mode=minute_mode,
+                    )
+                    if ((not validate_daily) or self._is_valid_daily_series(filtered, span_days)) and fresh_enough:
+                        if minute_mode and not self._minute_left_coverage_ok(filtered, start_datetime=start_value):
+                            ranges_to_fetch = [(start_value, end_value)]
+                            self._emit_progress(progress_cb, 14, "缓存左侧缺口，执行全区间修复")
+                        else:
+                            self._emit_progress(progress_cb, 100, "命中缓存")
+                            return FetchResponse(
+                                title=title,
+                                dataframe=filtered,
+                                cache_path=str(
+                                    cached_path
+                                    if cached_path is not None
+                                    else (parquet_path if parquet_path.exists() else pickle_path)
+                                ),
+                                from_cache=True,
+                            )
+                    else:
+                        ranges_to_fetch = [(start_value, end_value)]
+                        self._emit_progress(progress_cb, 14, "缓存完整但质量不足，执行全区间修复")
+                else:
+                    ranges_to_fetch = ranges
 
         if minute_mode:
             expanded: list[tuple[str, str]] = []
@@ -740,8 +829,27 @@ class DataService:
                         merged = cached_df
                         fresh_enough = True
             if not fresh_enough:
-                detail = " | ".join(fetch_failures) if fetch_failures else "stale_tail"
-                raise RuntimeError(f"all_sources_stale|{detail}")
+                if minute_mode:
+                    tail_ts = self._series_tail_timestamp(filtered)
+                    tail_text = tail_ts.strftime("%Y-%m-%d %H:%M:%S") if tail_ts is not None else "--"
+                    title_out = f"{title_out}（分钟末端滞后: {tail_text}）"
+                else:
+                    detail = " | ".join(fetch_failures) if fetch_failures else "stale_tail"
+                    raise RuntimeError(f"all_sources_stale|{detail}")
+
+        if minute_mode and (merged is not None) and (not merged.empty):
+            try:
+                covered = self._series_cache.covers_range(merged, start_value, end_value, minute_mode)
+            except Exception:
+                covered = True
+            if not covered:
+                _, ts = self._extract_ts(merged)
+                if ts is not None:
+                    ts_clean = ts.dropna()
+                    if not ts_clean.empty:
+                        actual_min = pd.Timestamp(ts_clean.min()).strftime("%Y-%m-%d %H:%M:%S")
+                        actual_max = pd.Timestamp(ts_clean.max()).strftime("%Y-%m-%d %H:%M:%S")
+                        title_out = f"{title_out}（实际 {actual_min}-{actual_max}）"
 
         self._emit_progress(progress_cb, 88, "合并缓存")
         changed = self._series_cache.dataframe_changed(cached_df, merged)
@@ -755,7 +863,7 @@ class DataService:
         )
         self._emit_progress(progress_cb, 100, "完成")
         return FetchResponse(
-            title=title,
+            title=title_out,
             dataframe=filtered,
             cache_path=str(cache_path),
             from_cache=not changed and cached_path is not None,
@@ -1450,17 +1558,6 @@ class DataService:
         period: str,
     ) -> dict[str, Callable[[str, str], pd.DataFrame]]:
         return {
-            "eastmoney_min": lambda s, e: self._filter_by_datetime(
-                ak.stock_zh_a_hist_min_em(
-                    symbol=symbol,
-                    start_date=s,
-                    end_date=e,
-                    period=period,
-                    adjust="",
-                ),
-                s,
-                e,
-            ),
             "tx_min": lambda s, e: self._filter_minute_source_with_fallback(
                 self._fetch_stock_minute_window_tx(symbol=symbol, period=period),
                 start_date=s,
@@ -1470,6 +1567,20 @@ class DataService:
                 self._fetch_stock_minute_window(symbol=symbol, period=period),
                 start_date=s,
                 end_date=e,
+            ),
+            "eastmoney_min": lambda s, e: self._filter_by_datetime(
+                self._call_df_with_timeout(
+                    lambda: ak.stock_zh_a_hist_min_em(
+                        symbol=symbol,
+                        start_date=s,
+                        end_date=e,
+                        period=period,
+                        adjust="",
+                    ),
+                    timeout_seconds=12.0,
+                ),
+                s,
+                e,
             ),
         }
 
@@ -1482,32 +1593,35 @@ class DataService:
         sources: dict[str, Callable[[str, str], pd.DataFrame]] = {}
         key = symbol.strip().lower().replace("sh", "").replace("sz", "").strip()
         if key:
+            sources["tx_min"] = (
+                lambda s, e: self._filter_minute_source_with_fallback(
+                    self._fetch_index_minute_window_tx(symbol=symbol, period=period),
+                    start_date=s,
+                    end_date=e,
+                )
+            )
+            sources["sina_min"] = (
+                lambda s, e: self._filter_minute_source_with_fallback(
+                    self._fetch_index_minute_window(symbol=symbol, period=period),
+                    start_date=s,
+                    end_date=e,
+                )
+            )
             sources[f"index_min:{key}"] = (
                 lambda s, e, k=key: self._filter_by_datetime(
-                    ak.index_zh_a_hist_min_em(
-                        symbol=k,
-                        period=period,
-                        start_date=s,
-                        end_date=e,
+                    self._call_df_with_timeout(
+                        lambda: ak.index_zh_a_hist_min_em(
+                            symbol=k,
+                            period=period,
+                            start_date=s,
+                            end_date=e,
+                        ),
+                        timeout_seconds=12.0,
                     ),
                     s,
                     e,
                 )
             )
-        sources["tx_min"] = (
-            lambda s, e: self._filter_minute_source_with_fallback(
-                self._fetch_index_minute_window_tx(symbol=symbol, period=period),
-                start_date=s,
-                end_date=e,
-            )
-        )
-        sources["sina_min"] = (
-            lambda s, e: self._filter_minute_source_with_fallback(
-                self._fetch_index_minute_window(symbol=symbol, period=period),
-                start_date=s,
-                end_date=e,
-            )
-        )
         return sources
 
     @classmethod
@@ -1538,23 +1652,41 @@ class DataService:
 
     def _fetch_stock_minute_window(self, *, symbol: str, period: str) -> pd.DataFrame:
         quote_symbol = self._normalize_stock_symbol(symbol)
-        return self._rename_day_to_datetime(
-            ak.stock_zh_a_minute(symbol=quote_symbol, period=period, adjust="")
+        return self._get_minute_window_cached(
+            key=("sina_stock", quote_symbol, str(period)),
+            loader=lambda: self._rename_day_to_datetime(
+                self._call_df_with_timeout(
+                    lambda: ak.stock_zh_a_minute(symbol=quote_symbol, period=period, adjust=""),
+                    timeout_seconds=10.0,
+                )
+            ),
         )
 
     def _fetch_index_minute_window(self, *, symbol: str, period: str) -> pd.DataFrame:
         quote_symbol = self._normalize_index_symbol(symbol)
-        return self._rename_day_to_datetime(
-            ak.stock_zh_a_minute(symbol=quote_symbol, period=period, adjust="")
+        return self._get_minute_window_cached(
+            key=("sina_index", quote_symbol, str(period)),
+            loader=lambda: self._rename_day_to_datetime(
+                self._call_df_with_timeout(
+                    lambda: ak.stock_zh_a_minute(symbol=quote_symbol, period=period, adjust=""),
+                    timeout_seconds=10.0,
+                )
+            ),
         )
 
     def _fetch_stock_minute_window_tx(self, *, symbol: str, period: str) -> pd.DataFrame:
         quote_symbol = self._normalize_stock_symbol(symbol)
-        return self._fetch_minute_window_tx(symbol=quote_symbol, period=period)
+        return self._get_minute_window_cached(
+            key=("tx_stock", quote_symbol, str(period)),
+            loader=lambda: self._fetch_minute_window_tx(symbol=quote_symbol, period=period),
+        )
 
     def _fetch_index_minute_window_tx(self, *, symbol: str, period: str) -> pd.DataFrame:
         quote_symbol = self._normalize_index_symbol(symbol)
-        return self._fetch_minute_window_tx(symbol=quote_symbol, period=period)
+        return self._get_minute_window_cached(
+            key=("tx_index", quote_symbol, str(period)),
+            loader=lambda: self._fetch_minute_window_tx(symbol=quote_symbol, period=period),
+        )
 
     @staticmethod
     def _fetch_minute_window_tx(*, symbol: str, period: str) -> pd.DataFrame:
@@ -2032,9 +2164,9 @@ class DataService:
         return end_value
 
     @classmethod
-    def _clip_minute_end_by_checkpoint(cls, end_value: str) -> str:
+    def _clip_minute_end_by_checkpoint(cls, end_value: str, *, period: str) -> str:
         end_ts = pd.to_datetime(end_value, errors="coerce")
-        checkpoint_ts = pd.to_datetime(cls._minute_checkpoint(), format="%Y%m%d%H%M", errors="coerce")
+        checkpoint_ts = pd.to_datetime(cls._minute_checkpoint_for_period(period), format="%Y%m%d%H%M", errors="coerce")
         if pd.isna(end_ts) or pd.isna(checkpoint_ts):
             return end_value
         clipped = min(pd.Timestamp(end_ts), pd.Timestamp(checkpoint_ts))
@@ -2160,7 +2292,7 @@ class DataService:
     @classmethod
     def _market_checkpoint(cls, *, minute_mode: bool, period: str = "daily") -> str:
         if minute_mode:
-            return cls._minute_checkpoint()
+            return cls._minute_checkpoint_for_period(period)
         # Weekly/monthly bars are updated by newest daily bar inside current period.
         if period in {"weekly", "monthly"}:
             return cls._daily_checkpoint()
@@ -2209,6 +2341,66 @@ class DataService:
             return checkpoint.strftime("%Y%m%d%H%M")
         checkpoint = day + pd.Timedelta(hours=15)
         checkpoint = cls._guard_checkpoint_minute(checkpoint, now=now)
+        return checkpoint.strftime("%Y%m%d%H%M")
+
+    @classmethod
+    def _minute_checkpoint_for_period(cls, period: str) -> str:
+        mode = cls._normalize_period(period)
+        if mode not in {"1", "5", "15", "30", "60"}:
+            return cls._minute_checkpoint()
+        bar_minutes = int(mode)
+
+        now = pd.Timestamp.now()
+        day = now.normalize()
+
+        if not cls._is_trade_day(day):
+            trade_day = cls._previous_trade_day(day)
+            checkpoint = trade_day + pd.Timedelta(hours=15)
+            checkpoint = cls._guard_checkpoint_minute(checkpoint, now=now)
+            return checkpoint.strftime("%Y%m%d%H%M")
+
+        morning_start = day + pd.Timedelta(hours=9, minutes=30)
+        morning_end = day + pd.Timedelta(hours=11, minutes=30)
+        afternoon_start = day + pd.Timedelta(hours=13)
+        afternoon_end = day + pd.Timedelta(hours=15)
+
+        if now < morning_start:
+            trade_day = cls._previous_trade_day(day)
+            checkpoint = trade_day + pd.Timedelta(hours=15)
+            checkpoint = cls._guard_checkpoint_minute(checkpoint, now=now)
+            return checkpoint.strftime("%Y%m%d%H%M")
+
+        if now < (morning_start + pd.Timedelta(minutes=bar_minutes)):
+            trade_day = cls._previous_trade_day(day)
+            checkpoint = trade_day + pd.Timedelta(hours=15)
+            checkpoint = cls._guard_checkpoint_minute(checkpoint, now=now)
+            return checkpoint.strftime("%Y%m%d%H%M")
+
+        if now <= morning_end:
+            minutes = int((min(now, morning_end) - morning_start).total_seconds() // 60)
+            bars = max(1, minutes // bar_minutes)
+            checkpoint = morning_start + pd.Timedelta(minutes=bars * bar_minutes)
+            checkpoint = min(checkpoint, morning_end)
+            checkpoint = cls._guard_checkpoint_minute(checkpoint, now=now)
+            return checkpoint.strftime("%Y%m%d%H%M")
+
+        if now < afternoon_start:
+            checkpoint = cls._guard_checkpoint_minute(morning_end, now=now)
+            return checkpoint.strftime("%Y%m%d%H%M")
+
+        if now < (afternoon_start + pd.Timedelta(minutes=bar_minutes)):
+            checkpoint = cls._guard_checkpoint_minute(morning_end, now=now)
+            return checkpoint.strftime("%Y%m%d%H%M")
+
+        if now <= afternoon_end:
+            minutes = int((min(now, afternoon_end) - afternoon_start).total_seconds() // 60)
+            bars = max(1, minutes // bar_minutes)
+            checkpoint = afternoon_start + pd.Timedelta(minutes=bars * bar_minutes)
+            checkpoint = min(checkpoint, afternoon_end)
+            checkpoint = cls._guard_checkpoint_minute(checkpoint, now=now)
+            return checkpoint.strftime("%Y%m%d%H%M")
+
+        checkpoint = cls._guard_checkpoint_minute(afternoon_end, now=now)
         return checkpoint.strftime("%Y%m%d%H%M")
 
     @classmethod

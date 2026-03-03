@@ -11,7 +11,7 @@ from pathlib import Path
 
 import akshare as ak
 import pandas as pd
-from PySide6.QtCore import QDate, QLocale, QPoint, Qt, QThread, QSignalBlocker, QTimer, Signal, QStringListModel
+from PySide6.QtCore import QDate, QEventLoop, QLocale, QPoint, Qt, QThread, QSignalBlocker, QTimer, Signal, QStringListModel
 from PySide6.QtGui import QBrush, QColor, QFont, QIcon, QKeySequence, QShortcut, QTextCharFormat
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QProgressBar,
+    QProgressDialog,
     QHeaderView,
     QScrollArea,
     QStackedWidget,
@@ -54,6 +55,7 @@ from GUI.widgets.flow_pie import FlowPieWidget
 from GUI.widgets.market_chart import MarketChartWidget
 from GUI.widgets.styled_combo_box import StyledComboBox
 from GUI.workers.fetch_worker import FetchWorker
+from GUI.workers.preload_worker import PreloadWorker
 from core.unified_data_module import UnifiedDataModule
 
 
@@ -463,8 +465,10 @@ class MainWindow(QMainWindow):
         watch_card_layout.setSpacing(0)
         self.watch_list = QTableWidget()
         self.watch_list.setObjectName("watchListTable")
-        self.watch_list.setColumnCount(8)
-        self.watch_list.setHorizontalHeaderLabels(["序号", "证券代码", "证券名称", "现价", "涨幅%", "涨跌", "涨速%", "换手%"])
+        self.watch_list.setColumnCount(9)
+        self.watch_list.setHorizontalHeaderLabels(
+            ["序号", "证券代码", "证券名称", "类型", "现价", "涨幅%", "涨跌", "涨速%", "换手%"]
+        )
         self.watch_list.setAlternatingRowColors(True)
         self.watch_list.setSortingEnabled(False)
         self.watch_list.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -1382,7 +1386,8 @@ class MainWindow(QMainWindow):
             self.watch_list.setItem(row - 1, 0, self._make_watch_item(str(row), align=Qt.AlignCenter))
             self.watch_list.setItem(row - 1, 1, self._make_watch_item(symbol))
             self.watch_list.setItem(row - 1, 2, self._make_watch_item(name or "--"))
-            for col in (3, 4, 5, 6, 7):
+            self.watch_list.setItem(row - 1, 3, self._make_watch_item(self._infer_watch_symbol_type(symbol), align=Qt.AlignCenter))
+            for col in (4, 5, 6, 7, 8):
                 self.watch_list.setItem(row - 1, col, self._make_watch_item("--", align=Qt.AlignRight | Qt.AlignVCenter))
         self._autosize_watch_columns()
         if self.left_pages.currentIndex() == self.PAGE_WATCH:
@@ -1605,11 +1610,12 @@ class MainWindow(QMainWindow):
             payload = spot.get(symbol, {})
             name = str(payload.get("name", "") or self._symbol_code_to_name.get(symbol, "") or "--")
             self.watch_list.setItem(row, 2, self._make_watch_item(name))
-            self.watch_list.setItem(row, 3, self._make_watch_item(self._format_watch_value(payload.get("price")), align=Qt.AlignRight | Qt.AlignVCenter))
-            self.watch_list.setItem(row, 4, self._make_watch_item(self._format_watch_value(payload.get("pct"), signed=True), align=Qt.AlignRight | Qt.AlignVCenter, color=self._watch_signed_color(payload.get("pct"))))
-            self.watch_list.setItem(row, 5, self._make_watch_item(self._format_watch_value(payload.get("chg"), signed=True), align=Qt.AlignRight | Qt.AlignVCenter, color=self._watch_signed_color(payload.get("chg"))))
-            self.watch_list.setItem(row, 6, self._make_watch_item(self._format_watch_value(payload.get("speed"), signed=True), align=Qt.AlignRight | Qt.AlignVCenter, color=self._watch_signed_color(payload.get("speed"))))
-            self.watch_list.setItem(row, 7, self._make_watch_item(self._format_watch_value(payload.get("turnover")), align=Qt.AlignRight | Qt.AlignVCenter))
+            self.watch_list.setItem(row, 3, self._make_watch_item(self._infer_watch_symbol_type(symbol), align=Qt.AlignCenter))
+            self.watch_list.setItem(row, 4, self._make_watch_item(self._format_watch_value(payload.get("price")), align=Qt.AlignRight | Qt.AlignVCenter))
+            self.watch_list.setItem(row, 5, self._make_watch_item(self._format_watch_value(payload.get("pct"), signed=True), align=Qt.AlignRight | Qt.AlignVCenter, color=self._watch_signed_color(payload.get("pct"))))
+            self.watch_list.setItem(row, 6, self._make_watch_item(self._format_watch_value(payload.get("chg"), signed=True), align=Qt.AlignRight | Qt.AlignVCenter, color=self._watch_signed_color(payload.get("chg"))))
+            self.watch_list.setItem(row, 7, self._make_watch_item(self._format_watch_value(payload.get("speed"), signed=True), align=Qt.AlignRight | Qt.AlignVCenter, color=self._watch_signed_color(payload.get("speed"))))
+            self.watch_list.setItem(row, 8, self._make_watch_item(self._format_watch_value(payload.get("turnover")), align=Qt.AlignRight | Qt.AlignVCenter))
         self._autosize_watch_columns()
 
     def _load_watch_spot_fallback_by_symbol(self, symbols: list[str]) -> dict[str, dict[str, object]]:
@@ -1791,6 +1797,54 @@ class MainWindow(QMainWindow):
             return f"bj{raw}"
         return f"sz{raw}"
 
+    @staticmethod
+    def _is_etf_code(code: str) -> bool:
+        raw = str(code or "").strip().lower().replace("sh", "").replace("sz", "").replace("bj", "")
+        if not (raw.isdigit() and len(raw) == 6):
+            return False
+        return raw.startswith(
+            (
+                "510",
+                "511",
+                "512",
+                "513",
+                "515",
+                "516",
+                "518",
+                "588",
+                "159",
+                "563",
+                "561",
+                "513",
+                "501",
+            )
+        )
+
+    def _infer_watch_symbol_type(self, symbol: str) -> str:
+        raw = str(symbol or "").strip().lower()
+        if not raw:
+            return "--"
+        # Preserve explicit index prefixes when user types sh/sz index codes.
+        code = raw.replace("sh", "").replace("sz", "").replace("bj", "")
+        if not (code.isdigit() and len(code) == 6):
+            return "--"
+
+        if self._is_etf_code(code):
+            return "ETF"
+
+        if raw.startswith(("sh", "sz")) and code in UnifiedDataModule.KNOWN_INDEX_CODES:
+            return "指数"
+
+        if code.startswith(("399", "980")) or code in UnifiedDataModule.KNOWN_INDEX_CODES:
+            # Prefer A股 when code exists in the current stock list (e.g. 000001).
+            if code not in self._symbol_code_to_name:
+                return "指数"
+
+        if code.startswith(("8", "4")):
+            return "北交所"
+
+        return "A股"
+
     def _load_watch_spot_snapshot(self) -> None:
         path = self._watch_spot_snapshot_file
         if not path.exists():
@@ -1819,7 +1873,7 @@ class MainWindow(QMainWindow):
 
     def _autosize_watch_columns(self) -> None:
         header = self.watch_list.horizontalHeader()
-        min_widths = {0: 52, 1: 92, 2: 132, 3: 86, 4: 84, 5: 84, 6: 84, 7: 84}
+        min_widths = {0: 52, 1: 92, 2: 132, 3: 66, 4: 86, 5: 84, 6: 84, 7: 84, 8: 84}
         self._watch_resizing_columns = True
         try:
             for col in range(self.watch_list.columnCount()):
@@ -2238,7 +2292,7 @@ class MainWindow(QMainWindow):
         if period_value in {"1", "5", "15", "30", "60"}:
             # Align with data service minute checkpoint so we don't constantly treat the latest intraday
             # payload as stale (e.g. end fixed at 15:00 while checkpoint is 10:12).
-            checkpoint = DataService._minute_checkpoint()
+            checkpoint = DataService._minute_checkpoint_for_period(period_value)
             end_ts = pd.to_datetime(checkpoint, format="%Y%m%d%H%M", errors="coerce")
             if pd.isna(end_ts):
                 end_ts = pd.Timestamp.now().floor("min")
@@ -3736,6 +3790,10 @@ class MainWindow(QMainWindow):
         )
         self.log_box.append(item_html)
         self.log_box.verticalScrollBar().setValue(self.log_box.verticalScrollBar().maximum())
+        try:
+            self.log_box.horizontalScrollBar().setValue(self.log_box.horizontalScrollBar().minimum())
+        except Exception:
+            pass
 
     @staticmethod
     def _infer_log_level(message: str) -> str:
@@ -3843,10 +3901,52 @@ def run() -> None:
             app.setWindowIcon(qicon)
     app.setStyle("Fusion")
     apply_dark_palette(app)
+    preload_error: str | None = None
+    preload_thread = QThread()
+    preload_worker = PreloadWorker(cache_root())
+    preload_worker.moveToThread(preload_thread)
+    preload_dialog = QProgressDialog("正在初始化…", None, 0, 100)
+    preload_dialog.setWindowTitle("MoS Quant 初始化")
+    preload_dialog.setWindowModality(Qt.ApplicationModal)
+    preload_dialog.setCancelButton(None)
+    preload_dialog.setAutoClose(False)
+    preload_dialog.setMinimumDuration(0)
+    preload_dialog.setValue(0)
+
+    def _on_preload_progress(percent: int, message: str) -> None:
+        preload_dialog.setValue(max(0, min(100, int(percent))))
+        preload_dialog.setLabelText(str(message or "正在初始化…"))
+
+    def _on_preload_error(message: str) -> None:
+        nonlocal preload_error
+        preload_error = str(message or "").strip() or "初始化失败"
+
+    preload_worker.progress.connect(_on_preload_progress)
+    preload_worker.error.connect(_on_preload_error)
+    preload_thread.started.connect(preload_worker.run)
+
+    loop = QEventLoop()
+    preload_worker.finished.connect(loop.quit)
+    preload_worker.error.connect(loop.quit)
+    preload_worker.finished.connect(preload_thread.quit)
+    preload_worker.finished.connect(preload_worker.deleteLater)
+    preload_thread.finished.connect(preload_thread.deleteLater)
+
+    preload_dialog.show()
+    preload_thread.start()
+    loop.exec()
+    preload_thread.wait(5000)
+    preload_dialog.close()
+
     window = MainWindow()
     if icon is not None:
         window.setWindowIcon(icon)
     window.show()
+    if preload_error:
+        QTimer.singleShot(
+            450,
+            lambda: window._append_log(f"初始化阶段部分资源加载失败，将使用缓存/后续后台重试: {preload_error}"),
+        )
     app.exec()
 
 
