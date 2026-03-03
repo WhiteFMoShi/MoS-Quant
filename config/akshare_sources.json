@@ -1,0 +1,170 @@
+{
+  "a_spot": [
+    {
+      "name": "eastmoney",
+      "api_name": "stock_zh_a_spot_em",
+      "priority": 10,
+      "enabled": true
+    },
+    {
+      "name": "sina",
+      "api_name": "stock_zh_a_spot",
+      "priority": 20,
+      "enabled": true
+    }
+  ],
+  "a_hist": [
+    {
+      "name": "eastmoney",
+      "api_name": "stock_zh_a_hist",
+      "priority": 10,
+      "enabled": true
+    },
+    {
+      "name": "tencent",
+      "api_name": "stock_zh_a_hist_tx",
+      "priority": 20,
+      "enabled": true
+    },
+    {
+      "name": "sina",
+      "api_name": "stock_zh_a_daily",
+      "priority": 30,
+      "enabled": true
+    }
+  ],
+  "index_spot": [
+    {
+      "name": "eastmoney",
+      "api_name": "stock_zh_index_spot_em",
+      "priority": 10,
+      "enabled": true
+    },
+    {
+      "name": "sina",
+      "api_name": "stock_zh_index_spot_sina",
+      "priority": 20,
+      "enabled": true
+    },
+    {
+      "name": "tx_fallback",
+      "api_name": "__index_spot_from_tx__",
+      "priority": 30,
+      "enabled": true
+    }
+  ],
+  "index_hist": [
+    {
+      "name": "eastmoney",
+      "api_name": "stock_zh_index_daily_em",
+      "priority": 10,
+      "enabled": true
+    },
+    {
+      "name": "tencent",
+      "api_name": "stock_zh_index_daily_tx",
+      "priority": 20,
+      "enabled": true
+    }
+  ],
+  "etf_spot": [
+    {
+      "name": "eastmoney",
+      "api_name": "fund_etf_spot_em",
+      "priority": 10,
+      "enabled": true
+    },
+    {
+      "name": "ths",
+      "api_name": "fund_etf_spot_ths",
+      "priority": 20,
+      "enabled": true
+    }
+  ],
+  "etf_hist": [
+    {
+      "name": "eastmoney",
+      "api_name": "fund_etf_hist_em",
+      "priority": 10,
+      "enabled": true
+    },
+    {
+      "name": "sina",
+      "api_name": "fund_etf_hist_sina",
+      "priority": 20,
+      "enabled": true
+    }
+  ],
+  "trade_calendar": [
+    {
+      "name": "sina",
+      "api_name": "tool_trade_date_hist_sina",
+      "priority": 10,
+      "enabled": true
+    }
+  ],
+  "a_minute": [
+    {
+      "name": "eastmoney",
+      "api_name": "stock_zh_a_minute",
+      "priority": 10,
+      "enabled": true
+    }
+  ],
+  "stock_info": [
+    {
+      "name": "eastmoney",
+      "api_name": "stock_individual_info_em",
+      "priority": 10,
+      "enabled": true
+    }
+  ],
+  "industry_list": [
+    {
+      "name": "eastmoney",
+      "api_name": "stock_board_industry_name_em",
+      "priority": 10,
+      "enabled": true
+    }
+  ],
+  "industry_constituents": [
+    {
+      "name": "eastmoney",
+      "api_name": "stock_board_industry_cons_em",
+      "priority": 10,
+      "enabled": true
+    }
+  ],
+  "sector_fund_flow": [
+    {
+      "name": "eastmoney",
+      "api_name": "stock_sector_fund_flow_rank",
+      "priority": 10,
+      "enabled": true
+    }
+  ],
+  "shareholder_count": [
+    {
+      "name": "eastmoney",
+      "api_name": "stock_zh_a_gdhs",
+      "priority": 10,
+      "enabled": true
+    }
+  ],
+  "dragon_tiger": [
+    {
+      "name": "eastmoney",
+      "api_name": "stock_lhb_detail_em",
+      "priority": 10,
+      "enabled": true
+    }
+  ],
+  "notice": [
+    {
+      "name": "eastmoney",
+      "api_name": "stock_notice_report",
+      "priority": 10,
+      "enabled": true
+    }
+  ]
+}
