@@ -461,6 +461,13 @@ class DataService:
                         self._emit_progress(progress_cb, 8, "缓存末端落后，继续增量")
             if cached_df.empty:
                 cached_df, cached_path = self._series_cache.load(params, minute_mode)
+            if minute_mode and not cached_df.empty and self._is_low_density_minute_result(
+                cached_df,
+                span_days=span_days,
+                period=period_mode,
+            ):
+                cached_df = pd.DataFrame()
+                cached_path = None
             if self._is_sparse_result(cached_df, span_days, minute_mode):
                 cached_df = pd.DataFrame()
                 cached_path = None
@@ -623,6 +630,14 @@ class DataService:
         needs_repair = self._is_sparse_result(filtered, span_days, minute_mode) or (
             validate_daily and (not self._is_valid_daily_series(filtered, span_days))
         )
+        if minute_mode and (not filtered.empty) and (not self._minute_left_coverage_ok(filtered, start_datetime=start_value)):
+            needs_repair = True
+        if minute_mode and (not filtered.empty) and self._is_low_density_minute_result(
+            filtered,
+            span_days=span_days,
+            period=period_mode,
+        ):
+            needs_repair = True
         attempt_repair = needs_repair
         if minute_mode and fetch_failures and ((not cached_df.empty) or (not filtered.empty)):
             # Keep fast path when we already have usable minute data from cache or fetched parts.
@@ -725,12 +740,8 @@ class DataService:
                         merged = cached_df
                         fresh_enough = True
             if not fresh_enough:
-                if minute_mode:
-                    # Minute endpoints are often delayed; keep best-effort payload instead of hard failing.
-                    self._emit_progress(progress_cb, 86, "分钟数据末端滞后(允许展示)")
-                else:
-                    detail = " | ".join(fetch_failures) if fetch_failures else "stale_tail"
-                    raise RuntimeError(f"all_sources_stale|{detail}")
+                detail = " | ".join(fetch_failures) if fetch_failures else "stale_tail"
+                raise RuntimeError(f"all_sources_stale|{detail}")
 
         self._emit_progress(progress_cb, 88, "合并缓存")
         changed = self._series_cache.dataframe_changed(cached_df, merged)
@@ -1290,6 +1301,7 @@ class DataService:
 
         # Sequential fallback is more stable than multi-source parallel burst for minute endpoints.
         candidates: list[tuple[str, pd.DataFrame]] = []
+        partial_candidates: list[tuple[str, pd.DataFrame]] = []
         for name in ordered_names:
             try:
                 df = sources[name](start_date, end_date)
@@ -1299,11 +1311,13 @@ class DataService:
             if df is None or df.empty:
                 errors.append(f"{name}:sparse_result")
                 continue
-            candidates.append((name, df))
-            if (not self._is_minute_tail_stale(df, end_datetime=end_date)) and self._minute_left_coverage_ok(
-                df,
-                start_datetime=start_date,
-            ):
+            left_ok = self._minute_left_coverage_ok(df, start_datetime=start_date)
+            if left_ok:
+                candidates.append((name, df))
+            else:
+                partial_candidates.append((name, df))
+                errors.append(f"{name}:left_gap")
+            if (not self._is_minute_tail_stale(df, end_datetime=end_date)) and left_ok:
                 return df.reset_index(drop=True)
 
         # Final rescue: pull a raw minute window once and slice locally.
@@ -1321,19 +1335,22 @@ class DataService:
                     end_date=end_date,
                 )
                 if rescue_df is not None and not rescue_df.empty:
-                    candidates.append((window_name, rescue_df))
-                    if (not self._is_minute_tail_stale(rescue_df, end_datetime=end_date)) and self._minute_left_coverage_ok(
-                        rescue_df,
-                        start_datetime=start_date,
-                    ):
+                    left_ok = self._minute_left_coverage_ok(rescue_df, start_datetime=start_date)
+                    if left_ok:
+                        candidates.append((window_name, rescue_df))
+                    else:
+                        partial_candidates.append((window_name, rescue_df))
+                        errors.append(f"{window_name}:left_gap")
+                    if (not self._is_minute_tail_stale(rescue_df, end_datetime=end_date)) and left_ok:
                         return rescue_df.reset_index(drop=True)
                 else:
                     errors.append(f"{window_name}:sparse_result")
             except Exception as exc:
                 errors.append(f"{window_name}:{exc}")
 
+        final_candidates = candidates if candidates else partial_candidates
         picked = self._pick_freshest_source_result(
-            candidates,
+            final_candidates,
             end_value=end_date,
             period=period,
             minute_mode=True,
@@ -1342,7 +1359,7 @@ class DataService:
         )
         if picked is not None:
             return picked[1].reset_index(drop=True)
-        for _, df in candidates:
+        for _, df in final_candidates:
             if df is not None and not df.empty:
                 return df.reset_index(drop=True)
         raise RuntimeError(" | ".join(errors))
@@ -1364,6 +1381,7 @@ class DataService:
 
         # Sequential fallback is more stable than multi-source parallel burst for minute endpoints.
         candidates_df: list[tuple[str, pd.DataFrame]] = []
+        partial_candidates_df: list[tuple[str, pd.DataFrame]] = []
         for name in ordered_names:
             try:
                 df = sources[name](start_date, end_date)
@@ -1373,11 +1391,13 @@ class DataService:
             if df is None or df.empty:
                 errors.append(f"{name}:sparse_result")
                 continue
-            candidates_df.append((name, df))
-            if (not self._is_minute_tail_stale(df, end_datetime=end_date)) and self._minute_left_coverage_ok(
-                df,
-                start_datetime=start_date,
-            ):
+            left_ok = self._minute_left_coverage_ok(df, start_datetime=start_date)
+            if left_ok:
+                candidates_df.append((name, df))
+            else:
+                partial_candidates_df.append((name, df))
+                errors.append(f"{name}:left_gap")
+            if (not self._is_minute_tail_stale(df, end_datetime=end_date)) and left_ok:
                 return df.reset_index(drop=True)
 
         # Final rescue: pull a raw minute window once and slice locally.
@@ -1394,19 +1414,22 @@ class DataService:
                     end_date=end_date,
                 )
                 if rescue_df is not None and not rescue_df.empty:
-                    candidates_df.append((window_name, rescue_df))
-                    if (not self._is_minute_tail_stale(rescue_df, end_datetime=end_date)) and self._minute_left_coverage_ok(
-                        rescue_df,
-                        start_datetime=start_date,
-                    ):
+                    left_ok = self._minute_left_coverage_ok(rescue_df, start_datetime=start_date)
+                    if left_ok:
+                        candidates_df.append((window_name, rescue_df))
+                    else:
+                        partial_candidates_df.append((window_name, rescue_df))
+                        errors.append(f"{window_name}:left_gap")
+                    if (not self._is_minute_tail_stale(rescue_df, end_datetime=end_date)) and left_ok:
                         return rescue_df.reset_index(drop=True)
                 else:
                     errors.append(f"{window_name}:sparse_result")
             except Exception as exc:
                 errors.append(f"{window_name}:{exc}")
 
+        final_candidates_df = candidates_df if candidates_df else partial_candidates_df
         picked = self._pick_freshest_source_result(
-            candidates_df,
+            final_candidates_df,
             end_value=end_date,
             period=period,
             minute_mode=True,
@@ -1415,7 +1438,7 @@ class DataService:
         )
         if picked is not None:
             return picked[1].reset_index(drop=True)
-        for _, df in candidates_df:
+        for _, df in final_candidates_df:
             if df is not None and not df.empty:
                 return df.reset_index(drop=True)
         raise RuntimeError(" | ".join(errors))
@@ -1743,13 +1766,14 @@ class DataService:
 
     @staticmethod
     def _write_cache_dataframe(df: pd.DataFrame, parquet_path: Path, pickle_path: Path) -> Path:
+        safe_df = TimeSeriesCache._pickle_safe(df)
         try:
-            df.to_pickle(pickle_path)
+            safe_df.to_pickle(pickle_path)
         except Exception:
             pass
         if has_parquet_engine():
             try:
-                df.to_parquet(parquet_path, index=False)
+                safe_df.to_parquet(parquet_path, index=False)
                 return parquet_path
             except Exception:
                 try:
@@ -2284,6 +2308,28 @@ class DataService:
         return False
 
     @classmethod
+    def _is_low_density_minute_result(cls, df: pd.DataFrame, *, span_days: int | None, period: str) -> bool:
+        if df is None or df.empty:
+            return True
+        if span_days is None:
+            return len(df.index) <= 1
+        mode = cls._normalize_period(period)
+        bars_per_day = {
+            "1": 240,
+            "5": 48,
+            "15": 16,
+            "30": 8,
+            "60": 4,
+        }.get(mode, 48)
+        rows = int(len(df.index))
+        days = max(1, int(span_days))
+        # Heuristic: for large spans, returning only a tiny tail window is usually a windowed source fallback
+        # and will lock incremental mode on a stale tail (e.g. only one day returned for a 120-day window).
+        window_days = min(20, days)
+        min_expected = int(bars_per_day * window_days * 0.5)
+        return rows < max(12, min_expected)
+
+    @classmethod
     def _is_valid_daily_series(cls, df: pd.DataFrame, span_days: int | None) -> bool:
         if df is None or df.empty:
             return False
@@ -2391,34 +2437,12 @@ class DataService:
             end_ts = pd.to_datetime(end_value, errors="coerce")
             if pd.isna(end_ts):
                 return True
-            mode = cls._normalize_period(period)
-            bar_minutes = 1
-            try:
-                if mode in {"1", "5", "15", "30", "60"}:
-                    bar_minutes = max(1, int(mode))
-            except Exception:
-                bar_minutes = 1
-            gap = pd.Timestamp(end_ts) - pd.Timestamp(tail_ts)
-            if gap <= pd.Timedelta(0):
-                return True
-            end_day = pd.Timestamp(end_ts).normalize()
-            tail_day = pd.Timestamp(tail_ts).normalize()
-            now_day = pd.Timestamp.now().normalize()
-            # Same-session gaps: 15m bars may end at 14:45 while UI end is 15:00.
-            if tail_day == end_day:
-                return gap <= pd.Timedelta(minutes=max(8, int(bar_minutes) * 2))
-            # If request end falls on a non-trading day, previous trade day's close is acceptable.
-            if not cls._is_trade_day(end_day):
-                prev = cls._previous_trade_day(end_day).normalize()
-                if tail_day >= prev:
-                    return True
-                return False
-            # Near-now requests: allow at most 1 trade day lag (upstream delays are common).
-            if end_day >= (now_day - pd.Timedelta(days=2)):
-                prev = cls._previous_trade_day(end_day).normalize()
-                if tail_day >= prev:
-                    return True
-            return False
+            return cls._minute_fresh_enough_for_end(
+                tail_ts=pd.Timestamp(tail_ts),
+                end_ts=pd.Timestamp(end_ts),
+                period=period,
+                now=pd.Timestamp.now(),
+            )
 
         # keep period in signature for call-site clarity and future policy tuning
         _ = cls._normalize_period(period)
@@ -2433,6 +2457,53 @@ class DataService:
         if not cls._is_trade_day(target_day):
             return tail_day >= cls._previous_trade_day(target_day).normalize()
         return False
+
+    @classmethod
+    def _minute_fresh_enough_for_end(
+        cls,
+        *,
+        tail_ts: pd.Timestamp,
+        end_ts: pd.Timestamp,
+        period: str,
+        now: pd.Timestamp,
+    ) -> bool:
+        mode = cls._normalize_period(period)
+        bar_minutes = 1
+        try:
+            if mode in {"1", "5", "15", "30", "60"}:
+                bar_minutes = max(1, int(mode))
+        except Exception:
+            bar_minutes = 1
+
+        gap = pd.Timestamp(end_ts) - pd.Timestamp(tail_ts)
+        if gap <= pd.Timedelta(0):
+            return True
+
+        end_day = pd.Timestamp(end_ts).normalize()
+        tail_day = pd.Timestamp(tail_ts).normalize()
+        now_ts = pd.Timestamp(now)
+        now_day = now_ts.normalize()
+
+        # Same-session gaps: 15m bars may end at 14:45 while UI end is 15:00.
+        if tail_day == end_day:
+            return gap <= pd.Timedelta(minutes=max(8, int(bar_minutes) * 2))
+
+        # If request end falls on a non-trading day, previous trade day's close is acceptable.
+        if not cls._is_trade_day(end_day):
+            prev = cls._previous_trade_day(end_day).normalize()
+            return tail_day >= prev
+
+        # If user asks for today's intraday window, yesterday's minutes are NOT acceptable
+        # once market is open; this would lock the UI on stale cached tails.
+        if end_day == now_day:
+            market_open = now_day + pd.Timedelta(hours=9, minutes=30)
+            if now_ts < market_open:
+                prev = cls._previous_trade_day(end_day).normalize()
+                return tail_day >= prev
+            return False
+
+        # For historical trade days, tail must reach that day.
+        return tail_day >= end_day
 
     @classmethod
     def _effective_start_for_cached_non_minute(cls, start_value: str, cached_df: pd.DataFrame) -> str:

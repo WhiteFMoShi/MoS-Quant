@@ -5,6 +5,7 @@ import json
 import re
 import threading
 import time
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 
@@ -114,8 +115,8 @@ class MainWindow(QMainWindow):
         self._concept_change_cache: dict[str, float] = {}
         self._help_left_md_path = self._project_root / "docs" / "help_bug_feedback.md"
         self._help_right_md_path = self._project_root / "docs" / "help_usage.md"
-        self._market_mem_cache_key: tuple[str, str, str, str, str] | None = None
-        self._market_mem_cache_response: FetchResponse | None = None
+        self._market_mem_cache: OrderedDict[tuple[str, str, str, str, str], FetchResponse] = OrderedDict()
+        self._market_mem_cache_limit = 10
         self._watch_spot_cache: dict[str, dict[str, object]] = {}
         self._watch_spot_cache_ts = 0.0
         self._watch_spot_loading = False
@@ -2210,12 +2211,17 @@ class MainWindow(QMainWindow):
         if request.force_refresh:
             return False
         key = self._market_request_cache_key(request)
-        cached = self._market_mem_cache_response
-        if cached is None or self._market_mem_cache_key != key:
+        cached = self._market_mem_cache.get(key)
+        if cached is None:
             return False
         if not self._is_market_response_fresh(cached, request):
             self._append_log("内存缓存末端落后，自动执行网络增量更新")
+            try:
+                del self._market_mem_cache[key]
+            except KeyError:
+                pass
             return False
+        self._market_mem_cache.move_to_end(key, last=True)
         self._active_fetch_scene = "market"
         self._render_market_response(cached)
         self._append_log(
@@ -2229,16 +2235,24 @@ class MainWindow(QMainWindow):
         period = self.market_cycle_combo.currentData()
         period_value = period if isinstance(period, str) else "daily"
         today = QDate.currentDate()
-
         if period_value in {"1", "5", "15", "30", "60"}:
-            start = today.addDays(-self._minute_window_days(period_value))
-            start_text = f"{start.toString('yyyy-MM-dd')} 09:30:00"
-            end_text = f"{today.toString('yyyy-MM-dd')} 15:00:00"
+            # Align with data service minute checkpoint so we don't constantly treat the latest intraday
+            # payload as stale (e.g. end fixed at 15:00 while checkpoint is 10:12).
+            checkpoint = DataService._minute_checkpoint()
+            end_ts = pd.to_datetime(checkpoint, format="%Y%m%d%H%M", errors="coerce")
+            if pd.isna(end_ts):
+                end_ts = pd.Timestamp.now().floor("min")
+            end_text = pd.Timestamp(end_ts).strftime("%Y-%m-%d %H:%M:%S")
+            start_ts = (pd.Timestamp(end_ts).normalize() - pd.Timedelta(days=self._minute_window_days(period_value))).replace(
+                hour=9,
+                minute=30,
+                second=0,
+            )
+            start_text = pd.Timestamp(start_ts).strftime("%Y-%m-%d %H:%M:%S")
         else:
-            start = QDate(1990, 1, 1)
-            end = self._latest_completed_trade_day(today)
-            start_text = start.toString("yyyy-MM-dd")
-            end_text = end.toString("yyyy-MM-dd")
+            checkpoint = DataService._daily_checkpoint()
+            start_text = "1990-01-01"
+            end_text = DataService._as_dash_date(checkpoint)
 
         dataset = self.market_dataset_combo.currentData()
         dataset_value = dataset if isinstance(dataset, str) else "index_daily"
@@ -2276,8 +2290,11 @@ class MainWindow(QMainWindow):
         if self._active_fetch_scene == "market":
             self._render_market_response(response)
             if self._last_fetch_request is not None:
-                self._market_mem_cache_key = self._market_request_cache_key(self._last_fetch_request)
-                self._market_mem_cache_response = response
+                key = self._market_request_cache_key(self._last_fetch_request)
+                self._market_mem_cache[key] = response
+                self._market_mem_cache.move_to_end(key, last=True)
+                while len(self._market_mem_cache) > int(self._market_mem_cache_limit):
+                    self._market_mem_cache.popitem(last=False)
         else:
             self.result_title.setText(response.title)
             self._render_dataframe(response.dataframe)
@@ -2368,6 +2385,7 @@ class MainWindow(QMainWindow):
         text = text.replace("Connection aborted.", "连接被中断")
         text = text.replace("Read timed out", "请求超时")
         text = text.replace("sparse_result", "该时间段返回为空（可能休市）")
+        text = text.replace("left_gap", "返回数据覆盖不足（窗口型分钟源限制）")
         text = text.replace("low_density", "返回序列异常稀疏（上游数据不完整）")
         text = text.replace("stale_tail", "返回数据末端滞后（未到最新交易日）")
         text = text.replace("all_sources_stale", "所有可用源返回旧数据（未到最新交易日）")
@@ -2393,6 +2411,8 @@ class MainWindow(QMainWindow):
             hints.append("网络波动或上游源站不稳定")
         if "sparse_result" in raw:
             hints.append("所选区间可能是休市日或无交易数据")
+        if "left_gap" in raw:
+            hints.append("分钟源只返回最近窗口，系统会尝试切换可按区间下载的源")
         if "stale_tail" in raw:
             hints.append("上游源返回较旧数据，系统已尝试切换其它源")
         if "all_sources_stale" in raw:

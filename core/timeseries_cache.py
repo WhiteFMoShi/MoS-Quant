@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
+from pandas.api.types import is_string_dtype
 
 from core.parquet_compat import has_parquet_engine
 
@@ -64,14 +65,30 @@ class TimeSeriesCache:
         return pd.read_pickle(path)
 
     @staticmethod
-    def write_dataframe(df: pd.DataFrame, parquet_path: Path, pickle_path: Path) -> Path:
+    def _pickle_safe(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return df
+        safe = df
         try:
-            df.to_pickle(pickle_path)
+            for col in df.columns:
+                if is_string_dtype(df[col].dtype):
+                    if safe is df:
+                        safe = df.copy()
+                    safe[col] = safe[col].astype(object)
+        except Exception:
+            return df
+        return safe
+
+    @staticmethod
+    def write_dataframe(df: pd.DataFrame, parquet_path: Path, pickle_path: Path) -> Path:
+        safe_df = TimeSeriesCache._pickle_safe(df)
+        try:
+            safe_df.to_pickle(pickle_path)
         except Exception:
             pass
         if has_parquet_engine():
             try:
-                df.to_parquet(parquet_path, index=False)
+                safe_df.to_parquet(parquet_path, index=False)
                 return parquet_path
             except Exception:
                 try:
