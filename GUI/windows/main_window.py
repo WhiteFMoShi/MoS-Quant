@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 import re
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -1026,6 +1027,7 @@ class MainWindow(QMainWindow):
         self._trade_dates_prepared = True
         if self._load_trade_dates_from_cache():
             self._refresh_all_calendar_marks()
+            self._append_trade_dates_status_log()
             # Cache-first for responsiveness, then refresh calendar source in background.
             self._schedule_trade_dates_retry(delay_seconds=2)
             return
@@ -1035,8 +1037,15 @@ class MainWindow(QMainWindow):
         threading.Thread(target=self._load_trade_dates_async, daemon=True).start()
 
     def _load_trade_dates_async(self) -> None:
+        # Delegate calendar fetch/validation to the core DataService so the entire app
+        # uses the same calendar quality rules and cache files.
         errors: list[str] = []
-        dates = sorted(self._load_trade_dates_remote(errors))
+        try:
+            DataService._refresh_trade_dates_cache_worker()
+            dates = sorted(DataService._load_trade_dates())
+        except Exception as exc:
+            errors.append(str(exc))
+            dates = []
         self.trade_dates_loaded.emit(dates, errors)
 
     def _on_trade_dates_loaded(self, dates_obj: object, errors_obj: object) -> None:
@@ -1057,7 +1066,7 @@ class MainWindow(QMainWindow):
             self._trade_dates_retry_count += 1
             self._schedule_trade_dates_retry()
             if errors:
-                self._append_log("交易日历主源波动，已回退为工作日规则（不影响数据抓取），后台将自动重试")
+                self._append_log("交易日历主源波动，已回退为工作日规则（假期附近可能影响最新性判断），后台将自动重试")
             return
 
         self._trade_dates_retry_count = 0
@@ -1065,9 +1074,30 @@ class MainWindow(QMainWindow):
         self._trade_dates_prepared = True
         self._trade_dates = dates
         self._persist_trade_dates_cache(self._trade_dates)
+        self._append_trade_dates_status_log()
         if errors:
             self._append_log("交易日历主源波动，已自动切换备用源")
         self._refresh_all_calendar_marks()
+
+    def _append_trade_dates_status_log(self) -> None:
+        try:
+            meta_path = self._cache_root / "market" / "trade_dates.meta.json"
+            if meta_path.exists():
+                payload = json.loads(meta_path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    src = str(payload.get("source", "--"))
+                    mx = str(payload.get("ts_max", "--"))
+                    rows = str(payload.get("rows", "--"))
+                    self._append_log(f"交易日历已加载: source={src}, max={mx}, rows={rows}")
+                    return
+        except Exception:
+            pass
+        try:
+            if self._trade_dates:
+                mx = max(self._trade_dates)
+                self._append_log(f"交易日历已加载: max={mx}, rows={len(self._trade_dates)}")
+        except Exception:
+            return
 
     def _schedule_trade_dates_retry(self, delay_seconds: int | None = None) -> None:
         if self._trade_dates_retry_scheduled or self._trade_dates_loading:
@@ -1086,6 +1116,7 @@ class MainWindow(QMainWindow):
         threading.Thread(target=self._load_trade_dates_async, daemon=True).start()
 
     def _load_trade_dates_remote(self, errors: list[str]) -> set[str]:
+        # Kept for backward-compatibility; core DataService is the source of truth now.
         def call_with_timeout(loader: object, timeout_seconds: float = 12.0) -> pd.DataFrame:
             payload: dict[str, object] = {}
             error: dict[str, Exception] = {}
@@ -1109,26 +1140,15 @@ class MainWindow(QMainWindow):
             return df
 
         loaders = (
-            ("sina_trade_calendar", lambda: ak.tool_trade_date_hist_sina()),
             ("tencent_index_daily_calendar", lambda: ak.stock_zh_index_daily_tx(symbol="sh000001")),
-            ("sina_index_daily_calendar", lambda: ak.stock_zh_index_daily(symbol="sh000001")),
-            (
-                "eastmoney_index_daily_calendar",
-                lambda: ak.index_zh_a_hist(
-                    symbol="000001",
-                    period="daily",
-                    start_date="19900101",
-                    end_date=QDate.currentDate().toString("yyyyMMdd"),
-                ),
-            ),
         )
         for source_name, loader in loaders:
             try:
                 df = call_with_timeout(loader, timeout_seconds=12.0)
                 dates = self._extract_trade_dates(df)
-                if dates:
+                if dates and (not self._is_synthetic_trade_dates(dates)):
                     return dates
-                errors.append(f"{source_name}:empty")
+                errors.append(f"{source_name}:invalid_calendar" if dates else f"{source_name}:empty")
             except Exception as exc:
                 errors.append(f"{source_name}:{exc}")
         return set()
@@ -1251,6 +1271,19 @@ class MainWindow(QMainWindow):
                 return True
             if mx > (now + pd.Timedelta(days=370)):
                 return True
+            # Stale or sparse calendars will break minute freshness checks around holidays.
+            if mx < (now - pd.Timedelta(days=20)):
+                return True
+            last_year = int(now.year) - 1
+            if last_year >= 1991:
+                y_start = pd.Timestamp(f"{last_year}-01-01")
+                y_end = pd.Timestamp(f"{last_year}-12-31")
+                if int(((ts >= y_start) & (ts <= y_end)).sum()) < 180:
+                    return True
+            if int(now.month) >= 2:
+                y_start = pd.Timestamp(f"{now.year}-01-01")
+                if int(((ts >= y_start) & (ts <= now)).sum()) < 10:
+                    return True
             return False
         except Exception:
             return True
@@ -3781,7 +3814,7 @@ class MainWindow(QMainWindow):
         safe_message = html.escape(message).replace("\n", "<br>")
         item_html = (
             f"<div style='margin:4px 0; padding:6px 8px; border-radius:8px; "
-            f"background:{bg}; color:{text};'>"
+            f"background:{bg}; color:{text}; text-align:left;'>"
             f"<span style='font-size:11px; opacity:0.78;'>[{ts}]</span> "
             f"<span style='font-size:11px; margin-left:4px; padding:1px 5px; "
             f"border-radius:6px; background:{border}; color:#ffffff;'>{label}</span> "
@@ -3792,6 +3825,50 @@ class MainWindow(QMainWindow):
         self.log_box.verticalScrollBar().setValue(self.log_box.verticalScrollBar().maximum())
         try:
             self.log_box.horizontalScrollBar().setValue(self.log_box.horizontalScrollBar().minimum())
+        except Exception:
+            pass
+
+    def _append_runtime_env_log(self) -> None:
+        try:
+            python = sys.executable
+        except Exception:
+            python = "--"
+        try:
+            ak_version = str(getattr(ak, "__version__", "--"))
+        except Exception:
+            ak_version = "--"
+        try:
+            import core.data_service as data_service_module
+
+            ds_path = str(Path(str(getattr(data_service_module, "__file__", "--"))).resolve())
+        except Exception:
+            ds_path = "--"
+        self._append_log(f"运行环境: python={python} | akshare={ak_version}")
+        self._append_log(f"代码位置: core.data_service={ds_path}")
+        try:
+            max_day = DataService._TRADE_DATES_MAX_DAY
+            rows = len(DataService._TRADE_DATES or []) if DataService._TRADE_DATES is not None else 0
+            if max_day is not None:
+                self._append_log(f"核心交易日历状态: max_day={pd.Timestamp(max_day).strftime('%Y-%m-%d')} rows={rows}")
+            else:
+                self._append_log(f"核心交易日历状态: max_day=-- rows={rows}")
+        except Exception:
+            pass
+        try:
+            market_dir = self._cache_root / "market"
+            pkl = market_dir / "trade_dates.pkl"
+            pq = market_dir / "trade_dates.parquet"
+            meta = market_dir / "trade_dates.meta.json"
+            self._append_log(
+                f"交易日历缓存: pkl={'Y' if pkl.exists() else 'N'} parquet={'Y' if pq.exists() else 'N'} meta={'Y' if meta.exists() else 'N'}"
+            )
+            if meta.exists():
+                payload = json.loads(meta.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    src = str(payload.get("source", "--"))
+                    mx = str(payload.get("ts_max", "--"))
+                    rows = str(payload.get("rows", "--"))
+                    self._append_log(f"交易日历缓存meta: source={src}, max={mx}, rows={rows}")
         except Exception:
             pass
 
@@ -3938,10 +4015,15 @@ def run() -> None:
     preload_thread.wait(5000)
     preload_dialog.close()
 
+    if preload_error and "trade_dates:" in preload_error:
+        QMessageBox.critical(None, "初始化失败", f"关键资源加载失败，已中止启动:\n{preload_error}")
+        return
+
     window = MainWindow()
     if icon is not None:
         window.setWindowIcon(icon)
     window.show()
+    QTimer.singleShot(350, window._append_runtime_env_log)
     if preload_error:
         QTimer.singleShot(
             450,

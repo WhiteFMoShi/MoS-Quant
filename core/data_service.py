@@ -6,6 +6,8 @@ from datetime import datetime
 import hashlib
 import json
 from pathlib import Path
+import subprocess
+import sys
 import threading
 import time
 from typing import Callable
@@ -48,10 +50,13 @@ class FetchResponse:
 class DataService:
     """Encapsulates AKShare data access for GUI and scripts."""
     DAILY_CLOSE_READY_HOUR = 15
-    DAILY_CLOSE_READY_MINUTE = 5
+    # Many upstream daily endpoints lag after 15:00; using too-early checkpoints
+    # causes false "stale" errors right after close.
+    DAILY_CLOSE_READY_MINUTE = 35
     _TRADE_DATES: set[str] | None = None
     _TRADE_DATES_MAX_DAY: pd.Timestamp | None = None
     _TRADE_DATES_REFRESHING: bool = False
+    _TRADE_DATES_SYNC_LOCK = threading.Lock()
     CHECKPOINT_MAX_LAG_DAYS = 45
 
     def __init__(self, cache_dir: Path | None = None) -> None:
@@ -61,8 +66,9 @@ class DataService:
         self._adopt_legacy_cache_files("datasets")
         self._cleanup_obsolete_series_cache_files()
         self._ensure_trade_dates_cache_refresh()
-        self._minute_window_mem: OrderedDict[tuple[str, str, str], pd.DataFrame] = OrderedDict()
+        self._minute_window_mem: OrderedDict[tuple[str, str, str], tuple[pd.DataFrame, float]] = OrderedDict()
         self._minute_window_mem_limit = 6
+        self._minute_window_mem_ttl_seconds = 25.0
 
     def _call_df_with_timeout(self, loader: Callable[[], pd.DataFrame], *, timeout_seconds: float = 12.0) -> pd.DataFrame:
         payload: dict[str, object] = {}
@@ -87,18 +93,55 @@ class DataService:
         return df
 
     def _get_minute_window_cached(self, *, key: tuple[str, str, str], loader: Callable[[], pd.DataFrame]) -> pd.DataFrame:
-        cached = self._minute_window_mem.get(key)
-        if cached is not None:
-            self._minute_window_mem.move_to_end(key, last=True)
-            return cached
+        cached_item = self._minute_window_mem.get(key)
+        if cached_item is not None:
+            cached_df, cached_ts = cached_item
+            if cached_df is not None and not cached_df.empty:
+                # If the cached snapshot looks extremely old, bypass TTL and refetch.
+                # This prevents rare stale snapshots from freezing the UI for ~TTL seconds.
+                if self._minute_window_snapshot_suspiciously_stale(cached_df):
+                    try:
+                        del self._minute_window_mem[key]
+                    except KeyError:
+                        pass
+                else:
+                    try:
+                        cache_age = float(time.time() - float(cached_ts))
+                    except Exception:
+                        cache_age = float(self._minute_window_mem_ttl_seconds) + 1.0
+                    # Window minute endpoints are dynamic; keep a short TTL to avoid freezing tails
+                    # when the app stays open for a long time.
+                    if cache_age <= float(self._minute_window_mem_ttl_seconds):
+                        self._minute_window_mem.move_to_end(key, last=True)
+                        return cached_df
+
         df = loader()
         if df is None:
             df = pd.DataFrame()
-        self._minute_window_mem[key] = df
-        self._minute_window_mem.move_to_end(key, last=True)
+        # Do not memoize extremely stale snapshots; allow next call to refetch immediately.
+        if not self._minute_window_snapshot_suspiciously_stale(df):
+            self._minute_window_mem[key] = (df, float(time.time()))
+            self._minute_window_mem.move_to_end(key, last=True)
         while len(self._minute_window_mem) > int(self._minute_window_mem_limit):
             self._minute_window_mem.popitem(last=False)
         return df
+
+    @staticmethod
+    def _minute_window_snapshot_suspiciously_stale(df: pd.DataFrame, *, max_lag_days: int = 10) -> bool:
+        if df is None or df.empty:
+            return False
+        try:
+            _, ts = DataService._extract_ts(df)
+            if ts is None:
+                return False
+            ts_clean = ts.dropna()
+            if ts_clean.empty:
+                return False
+            tail = pd.Timestamp(ts_clean.max())
+            now = pd.Timestamp.now()
+            return (now - tail) > pd.Timedelta(days=max(3, int(max_lag_days)))
+        except Exception:
+            return False
 
     def _ensure_trade_dates_cache_refresh(self) -> None:
         if DataService._TRADE_DATES_REFRESHING:
@@ -107,6 +150,83 @@ class DataService:
             return
         DataService._TRADE_DATES_REFRESHING = True
         threading.Thread(target=DataService._refresh_trade_dates_cache_worker, daemon=True).start()
+
+    @classmethod
+    def _trade_dates_look_valid(cls, ts: pd.Series, *, now: pd.Timestamp) -> bool:
+        """
+        Validate trade calendar quality.
+        Reject calendars that:
+        - end too far in the past (stale)
+        - are too sparse in recent years (often indicates parsing wrong column)
+        """
+        ts_clean = cls._normalize_trade_dates(ts)
+        if ts_clean.empty:
+            return False
+        now_day = pd.Timestamp(now).normalize()
+        ts_max = pd.Timestamp(ts_clean.max()).normalize()
+        if not cls._trade_dates_structure_ok(ts_clean, now=now_day):
+            return False
+        # During long holidays, the latest trade day may lag behind "today" by >5 days.
+        # Only treat as stale when it is *very* far behind (typically indicates parsing/source issue).
+        if ts_max < (now_day - pd.Timedelta(days=20)):
+            return False
+        return True
+
+    @classmethod
+    def _normalize_trade_dates(cls, ts: pd.Series) -> pd.Series:
+        try:
+            return pd.to_datetime(ts, errors="coerce").dropna().dt.normalize().drop_duplicates()
+        except Exception:
+            return pd.Series(dtype="datetime64[ns]")
+
+    @classmethod
+    def _trade_dates_structure_ok(cls, ts_clean: pd.Series, *, now: pd.Timestamp) -> bool:
+        """
+        Validate calendar *structure* without requiring it to be up-to-date.
+
+        This is used when loading a potentially stale on-disk calendar so we can still:
+        - keep a coverage boundary (max day) for holiday freshness guards
+        - avoid accepting obviously wrong/sparse calendars (e.g. wrong column parsed)
+        """
+        if ts_clean is None or len(ts_clean.index) == 0:
+            return False
+        try:
+            now_day = pd.Timestamp(now).normalize()
+            ts_min = pd.Timestamp(ts_clean.min()).normalize()
+            ts_max = pd.Timestamp(ts_clean.max()).normalize()
+        except Exception:
+            return False
+
+        # Synthetic weekday calendars tend to start at 1990-01-01 and extend far into the future.
+        if ts_min < pd.Timestamp("1990-12-01"):
+            return False
+        if ts_max > (now_day + pd.Timedelta(days=370)):
+            return False
+
+        # Too-small calendars are rarely real trade calendars.
+        if int(len(ts_clean.index)) < 3000:
+            return False
+
+        # The last full year should have a realistic amount of trading days.
+        last_year = int(now_day.year) - 1
+        if last_year < 1991:
+            return False
+        last_year_start = pd.Timestamp(f"{last_year}-01-01")
+        last_year_end = pd.Timestamp(f"{last_year}-12-31")
+        if ts_max < last_year_start:
+            return False
+        last_year_days = ts_clean[(ts_clean >= last_year_start) & (ts_clean <= last_year_end)]
+        if int(len(last_year_days.index)) < 180:
+            return False
+
+        # If the calendar claims to cover the current year, it should not be extremely sparse.
+        this_year_start = pd.Timestamp(f"{now_day.year}-01-01")
+        if ts_max >= this_year_start and int(now_day.month) >= 2:
+            this_year_days = ts_clean[(ts_clean >= this_year_start) & (ts_clean <= now_day)]
+            if int(len(this_year_days.index)) < 10:
+                return False
+
+        return True
 
     @classmethod
     def _trade_dates_cache_needs_refresh(cls) -> bool:
@@ -139,80 +259,234 @@ class DataService:
                 return True
             if ts_max > (now + pd.Timedelta(days=370)):
                 return True
+            if not cls._trade_dates_look_valid(ts, now=now):
+                return True
             return False
         return True
 
     @classmethod
+    def _persist_trade_dates_snapshot(cls, *, source: str, dates: list[str], ts_max: pd.Timestamp) -> None:
+        if not dates:
+            return
+        market_dir = cache_root() / "market"
+        market_dir.mkdir(parents=True, exist_ok=True)
+        pickle_path = market_dir / "trade_dates.pkl"
+        parquet_path = market_dir / "trade_dates.parquet"
+        meta_path = market_dir / "trade_dates.meta.json"
+
+        # Avoid overwriting a better existing cache with a worse snapshot.
+        try:
+            existing = None
+            if pickle_path.exists():
+                existing = pd.read_pickle(pickle_path)
+            elif parquet_path.exists() and has_parquet_engine():
+                existing = pd.read_parquet(parquet_path)
+            if existing is not None and not existing.empty:
+                col = "trade_date" if "trade_date" in existing.columns else existing.columns[0]
+                old_ts = cls._normalize_trade_dates(existing[col])
+                if not old_ts.empty and pd.Timestamp(old_ts.max()).normalize() > pd.Timestamp(ts_max).normalize():
+                    return
+        except Exception:
+            pass
+
+        cache_df = pd.DataFrame({"trade_date": pd.Series(dates, dtype="object")})
+        try:
+            cache_df.to_pickle(pickle_path)
+        except Exception:
+            pass
+        if has_parquet_engine():
+            try:
+                cache_df.to_parquet(parquet_path, index=False)
+            except Exception:
+                try:
+                    if parquet_path.exists():
+                        parquet_path.unlink()
+                except Exception:
+                    pass
+        try:
+            meta = {
+                "source": str(source),
+                "rows": int(len(dates)),
+                "ts_max": pd.Timestamp(ts_max).strftime("%Y-%m-%d"),
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    @classmethod
+    def _fetch_trade_dates_remote_best(
+        cls,
+        *,
+        timeout_seconds: float,
+        now: pd.Timestamp | None = None,
+    ) -> tuple[str, pd.Timestamp, list[str]]:
+        """
+        Fetch a fresh (up-to-date) trade calendar from network within a time budget.
+        Returns (source, ts_max, dates_list).
+        """
+        now_day = pd.Timestamp(now or pd.Timestamp.now()).normalize()
+        deadline = time.monotonic() + max(0.2, float(timeout_seconds))
+
+        def call_with_timeout(loader: Callable[[], pd.DataFrame], timeout_seconds: float) -> tuple[pd.DataFrame, str | None]:
+            payload: dict[str, object] = {}
+            error: dict[str, Exception] = {}
+
+            def runner() -> None:
+                try:
+                    payload["df"] = loader()
+                except Exception as exc:
+                    error["exc"] = exc
+
+            t = threading.Thread(target=runner, daemon=True)
+            t.start()
+            t.join(timeout=max(0.2, float(timeout_seconds)))
+            if t.is_alive():
+                return pd.DataFrame(), "timeout"
+            if "exc" in error:
+                return pd.DataFrame(), f"{type(error['exc']).__name__}:{error['exc']}"
+            df = payload.get("df")
+            if not isinstance(df, pd.DataFrame):
+                return pd.DataFrame(), "invalid_df"
+            return df, None
+
+        def fetch_sina_calendar_via_subprocess(budget_seconds: float) -> tuple[str, pd.Timestamp, list[str]] | None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            budget = min(max(0.2, float(budget_seconds)), remaining)
+            code = r"""
+import json, datetime
+import requests
+import pandas as pd
+from akshare.stock.cons import hk_js_decode
+import py_mini_racer
+
+url = "https://finance.sina.com.cn/realstock/company/klc_td_sh.txt"
+r = requests.get(url, timeout=6)
+text = r.text
+payload = text.split("=", 1)[1].split(";", 1)[0].replace('"', "")
+js_code = py_mini_racer.MiniRacer()
+js_code.eval(hk_js_decode)
+raw = js_code.call("d", payload)
+out = []
+for item in (raw or []):
+    if isinstance(item, dict):
+        v = item.get("date") or item.get("trade_date") or item.get("day")
+    else:
+        v = item
+    if v is None:
+        continue
+    out.append(str(v)[:10])
+# Sina calendar misses 1992-05-04; align with akshare behavior
+out.append("1992-05-04")
+out = sorted(set(out))
+print(json.dumps(out, ensure_ascii=False))
+"""
+            try:
+                proc = subprocess.run(
+                    [sys.executable, "-c", code],
+                    capture_output=True,
+                    text=True,
+                    timeout=float(budget),
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                return None
+            if proc.returncode != 0:
+                return None
+            try:
+                dates = json.loads((proc.stdout or "").strip() or "[]")
+            except Exception:
+                return None
+            if not isinstance(dates, list) or not dates:
+                return None
+            ts = cls._normalize_trade_dates(pd.Series(dates, dtype="object"))
+            if ts.empty or (not cls._trade_dates_look_valid(ts, now=now_day)):
+                return None
+            dates_list = sorted(set(ts.dt.strftime("%Y-%m-%d").tolist()))
+            ts_max = pd.Timestamp(ts.max()).normalize()
+            return ("sina_trade_calendar", ts_max, dates_list)
+
+        loaders: tuple[tuple[str, Callable[[], pd.DataFrame], float], ...] = (
+            # Avoid in-process py_mini_racer (can be unstable under GUI threads); use subprocess.
+            ("sina_trade_calendar(subprocess)", lambda: pd.DataFrame(), 6.5),
+            # Fallback: infer calendar from Tencent daily (no py_mini_racer, but can be slow).
+            ("tencent_index_daily_calendar", lambda: ak.stock_zh_index_daily_tx(symbol="sh000001"), 3.0),
+        )
+
+        errors: list[str] = []
+        best: tuple[str, pd.Timestamp, list[str]] | None = None
+
+        # 1) Sina calendar via subprocess (preferred).
+        cand = fetch_sina_calendar_via_subprocess(6.5)
+        if cand is not None:
+            return cand
+
+        for source_name, loader, per_source_budget in loaders:
+            if source_name.startswith("sina_trade_calendar"):
+                # already tried via subprocess
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            budget = min(float(per_source_budget), max(0.2, remaining))
+            df, err = call_with_timeout(loader, timeout_seconds=budget)
+            if df is None or df.empty:
+                errors.append(f"{source_name}:{err or 'empty'}")
+                continue
+            col = None
+            for candidate in ("trade_date", "date", "日期", "datetime", "时间", "day"):
+                if candidate in df.columns:
+                    col = candidate
+                    break
+            if col is None:
+                col = df.columns[0]
+            ts = cls._normalize_trade_dates(df[col])
+            if ts.empty:
+                errors.append(f"{source_name}:empty_ts")
+                continue
+            if not cls._trade_dates_look_valid(ts, now=now_day):
+                ts_max = pd.Timestamp(ts.max()).normalize() if not ts.empty else None
+                errors.append(f"{source_name}:stale_or_sparse(max={ts_max})")
+                continue
+            dates_list = sorted(set(ts.dt.strftime("%Y-%m-%d").tolist()))
+            if len(dates_list) < 3000:
+                errors.append(f"{source_name}:too_few_rows({len(dates_list)})")
+                continue
+            ts_max = pd.Timestamp(ts.max()).normalize()
+            cand = (str(source_name), ts_max, dates_list)
+            if best is None or (cand[1] > best[1]) or (cand[1] == best[1] and len(cand[2]) > len(best[2])):
+                best = cand
+            # If we got a valid dedicated calendar, return immediately to save time budget.
+            if source_name == "sina_trade_calendar":
+                return cand
+
+        if best is None:
+            detail = " | ".join(errors) if errors else "no_source"
+            raise TimeoutError(f"trade_dates fetch failed within {timeout_seconds:.1f}s: {detail}")
+        return best
+
+    @classmethod
+    def _ensure_trade_dates_ready_sync(cls, *, timeout_seconds: float = 10.0) -> None:
+        """
+        Ensure trade dates are loaded (and preferably cached) for correctness.
+        This runs in worker threads too; keep it best-effort and guarded.
+        """
+        with cls._TRADE_DATES_SYNC_LOCK:
+            source, ts_max, dates_list = cls._fetch_trade_dates_remote_best(
+                timeout_seconds=float(timeout_seconds),
+                now=pd.Timestamp.now(),
+            )
+            cls._persist_trade_dates_snapshot(source=source, dates=dates_list, ts_max=ts_max)
+            cls._TRADE_DATES = set(dates_list)
+            cls._TRADE_DATES_MAX_DAY = pd.Timestamp(ts_max).normalize()
+
+    @classmethod
     def _refresh_trade_dates_cache_worker(cls) -> None:
         try:
-            def call_with_timeout(loader: object, timeout_seconds: float = 12.0) -> pd.DataFrame:
-                payload: dict[str, object] = {}
-                error: dict[str, Exception] = {}
-
-                def runner() -> None:
-                    try:
-                        payload["df"] = loader()
-                    except Exception as exc:
-                        error["exc"] = exc
-
-                t = threading.Thread(target=runner, daemon=True)
-                t.start()
-                t.join(timeout=max(0.5, float(timeout_seconds)))
-                if t.is_alive():
-                    raise TimeoutError("timeout")
-                if "exc" in error:
-                    raise error["exc"]
-                df = payload.get("df")
-                if not isinstance(df, pd.DataFrame):
-                    return pd.DataFrame()
-                return df
-
-            loaders = (
-                ("sina_trade_calendar", lambda: ak.tool_trade_date_hist_sina()),
-                ("tencent_index_daily_calendar", lambda: ak.stock_zh_index_daily_tx(symbol="sh000001")),
-                ("sina_index_daily_calendar", lambda: ak.stock_zh_index_daily(symbol="sh000001")),
-            )
-            ts = pd.Series(dtype="datetime64[ns]")
-            for _, loader in loaders:
-                try:
-                    df = call_with_timeout(loader, timeout_seconds=12.0)
-                except Exception:
-                    continue
-                if df is None or df.empty:
-                    continue
-                col = None
-                for candidate in ("trade_date", "date", "日期", "datetime", "时间", "day"):
-                    if candidate in df.columns:
-                        col = candidate
-                        break
-                if col is None:
-                    col = df.columns[0]
-                ts = pd.to_datetime(df[col], errors="coerce").dropna().dt.normalize()
-                if not ts.empty:
-                    break
-            if ts.empty:
-                return
-            dates = sorted(set(ts.dt.strftime("%Y-%m-%d").tolist()))
-            if len(dates) < 2000:
-                return
-            market_dir = cache_root() / "market"
-            market_dir.mkdir(parents=True, exist_ok=True)
-            pickle_path = market_dir / "trade_dates.pkl"
-            parquet_path = market_dir / "trade_dates.parquet"
-            cache_df = pd.DataFrame({"trade_date": pd.Series(dates, dtype="object")})
-            try:
-                cache_df.to_pickle(pickle_path)
-            except Exception:
-                pass
-            if has_parquet_engine():
-                try:
-                    cache_df.to_parquet(parquet_path, index=False)
-                except Exception:
-                    try:
-                        if parquet_path.exists():
-                            parquet_path.unlink()
-                    except Exception:
-                        pass
+            source, ts_max, dates_list = cls._fetch_trade_dates_remote_best(timeout_seconds=18.0, now=pd.Timestamp.now())
+            cls._persist_trade_dates_snapshot(source=source, dates=dates_list, ts_max=ts_max)
             cls._TRADE_DATES = None
             cls._TRADE_DATES_MAX_DAY = None
         finally:
@@ -223,6 +497,10 @@ class DataService:
         request: FetchRequest,
         progress_cb: Callable[[int, str], None] | None = None,
     ) -> FetchResponse:
+        # Trade calendar is mandatory for correctness (holiday checks, minute freshness).
+        dates = DataService._load_trade_dates()
+        if (not dates) or (DataService._TRADE_DATES_MAX_DAY is None):
+            raise DataServiceError("交易日历未准备好（需要网络拉取成功后才能下载）。请重启应用或检查网络。")
         if request.dataset == "stock_daily":
             return self._fetch_stock_daily(request, progress_cb=progress_cb)
         if request.dataset == "index_daily":
@@ -495,6 +773,7 @@ class DataService:
         range_start_value = start_value
         fresh_hash = self._series_fresh_hash(params, minute_mode)
         force_tail_refresh_due_stale = False
+        minute_require_fresh = False
         if not request.force_refresh:
             meta = self._series_cache.load_meta(params)
             if meta is not None and str(meta.get("fresh_hash", "")) == fresh_hash:
@@ -527,6 +806,17 @@ class DataService:
                         self._emit_progress(progress_cb, 8, "缓存末端落后，继续增量")
             if cached_df.empty:
                 cached_df, cached_path = self._series_cache.load(params, minute_mode)
+            if minute_mode and (cached_df is not None) and (not cached_df.empty):
+                lag_days = self._minute_tail_lag_days(cached_df, end_value=end_value)
+                if lag_days is not None and int(lag_days) >= 7:
+                    self._emit_progress(progress_cb, 8, f"分钟缓存末端严重滞后({lag_days}天)，自动失效重拉")
+                    try:
+                        self._series_cache.invalidate(params)
+                    except Exception:
+                        pass
+                    cached_df = pd.DataFrame()
+                    cached_path = None
+                    minute_require_fresh = True
             if minute_mode and not cached_df.empty and self._is_low_density_minute_result(
                 cached_df,
                 span_days=span_days,
@@ -683,7 +973,7 @@ class DataService:
             quick_incremental = (not request.force_refresh) and (not cached_df.empty)
             try:
                 if minute_mode:
-                    retries = 2 if quick_incremental else 3
+                    retries = 3 if quick_incremental else 3
                     delay_seconds = 0.3 if quick_incremental else 0.6
                 else:
                     retries = 1 if quick_incremental else 3
@@ -792,7 +1082,11 @@ class DataService:
                 self._emit_progress(progress_cb, 84, "网络失败，回退新鲜缓存")
             else:
                 detail = " | ".join(fetch_failures) if fetch_failures else "stale_tail"
-                raise RuntimeError(f"all_sources_stale|{detail}")
+                tail_ts = self._series_tail_timestamp(cached_filtered)
+                tail_text = tail_ts.strftime("%Y-%m-%d %H:%M:%S") if tail_ts is not None else "--"
+                raise RuntimeError(
+                    f"all_sources_stale|{detail}|tail={tail_text}|end={end_value}|rows={len(cached_filtered.index)}"
+                )
         if filtered.empty and cached_df.empty and fetch_failures:
             detail = " | ".join(fetch_failures)
             raise RuntimeError(detail)
@@ -830,11 +1124,29 @@ class DataService:
                         fresh_enough = True
             if not fresh_enough:
                 if minute_mode:
+                    lag_days = self._minute_tail_lag_days(filtered, end_value=end_value)
+                    if minute_require_fresh or (lag_days is not None and int(lag_days) >= 7):
+                        detail_base = " | ".join(fetch_failures) if fetch_failures else "stale_tail"
+                        tail_ts = self._series_tail_timestamp(filtered)
+                        tail_text = tail_ts.strftime("%Y-%m-%d %H:%M:%S") if tail_ts is not None else "--"
+                        try:
+                            checkpoint = self._minute_checkpoint_for_period(period_mode)
+                        except Exception:
+                            checkpoint = "--"
+                        detail = f"{detail_base}|tail={tail_text}|end={end_value}|cp={checkpoint}|rows={len(filtered.index)}"
+                        raise RuntimeError(f"all_sources_stale|{detail}")
                     tail_ts = self._series_tail_timestamp(filtered)
                     tail_text = tail_ts.strftime("%Y-%m-%d %H:%M:%S") if tail_ts is not None else "--"
                     title_out = f"{title_out}（分钟末端滞后: {tail_text}）"
                 else:
-                    detail = " | ".join(fetch_failures) if fetch_failures else "stale_tail"
+                    detail_base = " | ".join(fetch_failures) if fetch_failures else "stale_tail"
+                    tail_ts = self._series_tail_timestamp(filtered)
+                    tail_text = tail_ts.strftime("%Y-%m-%d %H:%M:%S") if tail_ts is not None else "--"
+                    try:
+                        checkpoint = self._daily_checkpoint()
+                    except Exception:
+                        checkpoint = "--"
+                    detail = f"{detail_base}|tail={tail_text}|end={end_value}|cp={checkpoint}|rows={len(filtered.index)}"
                     raise RuntimeError(f"all_sources_stale|{detail}")
 
         if minute_mode and (merged is not None) and (not merged.empty):
@@ -1399,6 +1711,8 @@ class DataService:
         end_date: str,
         period: str,
         preferred_source: str | None = None,
+        *,
+        allow_resample: bool = True,
     ) -> pd.DataFrame:
         errors: list[str] = []
         span_days = self._range_span_days(start_date, end_date, minute_mode=True)
@@ -1410,6 +1724,16 @@ class DataService:
         # Sequential fallback is more stable than multi-source parallel burst for minute endpoints.
         candidates: list[tuple[str, pd.DataFrame]] = []
         partial_candidates: list[tuple[str, pd.DataFrame]] = []
+        source_reports: list[str] = []
+
+        def report(name: str, df: pd.DataFrame) -> None:
+            try:
+                tail = self._series_tail_timestamp(df)
+                tail_text = tail.strftime("%Y-%m-%d %H:%M:%S") if tail is not None else "--"
+                source_reports.append(f"{name}:rows={len(df.index)} tail={tail_text}")
+            except Exception:
+                return
+
         for name in ordered_names:
             try:
                 df = sources[name](start_date, end_date)
@@ -1419,14 +1743,50 @@ class DataService:
             if df is None or df.empty:
                 errors.append(f"{name}:sparse_result")
                 continue
+            report(name, df)
             left_ok = self._minute_left_coverage_ok(df, start_datetime=start_date)
             if left_ok:
                 candidates.append((name, df))
             else:
                 partial_candidates.append((name, df))
                 errors.append(f"{name}:left_gap")
-            if (not self._is_minute_tail_stale(df, end_datetime=end_date)) and left_ok:
+            if left_ok and self._is_result_fresh_for_request_end(
+                df,
+                end_value=end_date,
+                period=period,
+                minute_mode=True,
+            ):
                 return df.reset_index(drop=True)
+
+        if allow_resample and str(period) == "15":
+            try:
+                base_5m = self._fetch_stock_minute(
+                    symbol=symbol,
+                    start_date=start_date,
+                    end_date=end_date,
+                    period="5",
+                    preferred_source=preferred_source,
+                    allow_resample=False,
+                )
+                resampled = self._resample_minute_to_minutes(base_5m, target_minutes=15)
+                resampled = self._filter_by_datetime(resampled, start_date, end_date)
+                if resampled is not None and not resampled.empty:
+                    report("resample_5m", resampled)
+                    left_ok = self._minute_left_coverage_ok(resampled, start_datetime=start_date)
+                    if left_ok:
+                        candidates.append(("resample_5m", resampled))
+                    else:
+                        partial_candidates.append(("resample_5m", resampled))
+                        errors.append("resample_5m:left_gap")
+                    if left_ok and self._is_result_fresh_for_request_end(
+                        resampled,
+                        end_value=end_date,
+                        period=period,
+                        minute_mode=True,
+                    ):
+                        return resampled.reset_index(drop=True)
+            except Exception as exc:
+                errors.append(f"resample_5m:{exc}")
 
         # Final rescue: pull a raw minute window once and slice locally.
         # This avoids chunk-level repeated failures causing complete request failure.
@@ -1443,20 +1803,26 @@ class DataService:
                     end_date=end_date,
                 )
                 if rescue_df is not None and not rescue_df.empty:
+                    report(window_name, rescue_df)
                     left_ok = self._minute_left_coverage_ok(rescue_df, start_datetime=start_date)
                     if left_ok:
                         candidates.append((window_name, rescue_df))
                     else:
                         partial_candidates.append((window_name, rescue_df))
                         errors.append(f"{window_name}:left_gap")
-                    if (not self._is_minute_tail_stale(rescue_df, end_datetime=end_date)) and left_ok:
+                    if left_ok and self._is_result_fresh_for_request_end(
+                        rescue_df,
+                        end_value=end_date,
+                        period=period,
+                        minute_mode=True,
+                    ):
                         return rescue_df.reset_index(drop=True)
                 else:
                     errors.append(f"{window_name}:sparse_result")
             except Exception as exc:
                 errors.append(f"{window_name}:{exc}")
 
-        final_candidates = candidates if candidates else partial_candidates
+        final_candidates = candidates + partial_candidates
         picked = self._pick_freshest_source_result(
             final_candidates,
             end_value=end_date,
@@ -1465,12 +1831,39 @@ class DataService:
             span_days=span_days,
             require_daily_valid=False,
         )
+        best_source: str | None = None
+        best_df: pd.DataFrame | None = None
         if picked is not None:
-            return picked[1].reset_index(drop=True)
-        for _, df in final_candidates:
-            if df is not None and not df.empty:
-                return df.reset_index(drop=True)
-        raise RuntimeError(" | ".join(errors))
+            best_source, best_df = picked[0], picked[1]
+        else:
+            for src, df in final_candidates:
+                if df is not None and not df.empty:
+                    best_source, best_df = src, df
+                    break
+        if best_df is None or best_df.empty:
+            raise RuntimeError(" | ".join(errors))
+
+        if not self._is_result_fresh_for_request_end(
+            best_df,
+            end_value=end_date,
+            period=period,
+            minute_mode=True,
+        ):
+            tail = self._series_tail_timestamp(best_df)
+            tail_text = tail.strftime("%Y-%m-%d %H:%M:%S") if tail is not None else "--"
+            detail_parts: list[str] = [
+                "stale_tail",
+                f"best={best_source or '--'}",
+                f"tail={tail_text}",
+                f"end={end_date}",
+                f"rows={len(best_df.index)}",
+            ]
+            # Keep the payload short but actionable for GUI dialogs.
+            detail_parts.extend(source_reports[:6])
+            detail_parts.extend(errors[:6])
+            raise RuntimeError("|".join(detail_parts))
+
+        return best_df.reset_index(drop=True)
 
     def _fetch_index_minute(
         self,
@@ -1479,6 +1872,8 @@ class DataService:
         end_date: str,
         period: str,
         preferred_source: str | None = None,
+        *,
+        allow_resample: bool = True,
     ) -> pd.DataFrame:
         errors: list[str] = []
         span_days = self._range_span_days(start_date, end_date, minute_mode=True)
@@ -1490,6 +1885,16 @@ class DataService:
         # Sequential fallback is more stable than multi-source parallel burst for minute endpoints.
         candidates_df: list[tuple[str, pd.DataFrame]] = []
         partial_candidates_df: list[tuple[str, pd.DataFrame]] = []
+        source_reports: list[str] = []
+
+        def report(name: str, df: pd.DataFrame) -> None:
+            try:
+                tail = self._series_tail_timestamp(df)
+                tail_text = tail.strftime("%Y-%m-%d %H:%M:%S") if tail is not None else "--"
+                source_reports.append(f"{name}:rows={len(df.index)} tail={tail_text}")
+            except Exception:
+                return
+
         for name in ordered_names:
             try:
                 df = sources[name](start_date, end_date)
@@ -1499,14 +1904,50 @@ class DataService:
             if df is None or df.empty:
                 errors.append(f"{name}:sparse_result")
                 continue
+            report(name, df)
             left_ok = self._minute_left_coverage_ok(df, start_datetime=start_date)
             if left_ok:
                 candidates_df.append((name, df))
             else:
                 partial_candidates_df.append((name, df))
                 errors.append(f"{name}:left_gap")
-            if (not self._is_minute_tail_stale(df, end_datetime=end_date)) and left_ok:
+            if left_ok and self._is_result_fresh_for_request_end(
+                df,
+                end_value=end_date,
+                period=period,
+                minute_mode=True,
+            ):
                 return df.reset_index(drop=True)
+
+        if allow_resample and str(period) == "15":
+            try:
+                base_5m = self._fetch_index_minute(
+                    symbol=symbol,
+                    start_date=start_date,
+                    end_date=end_date,
+                    period="5",
+                    preferred_source=preferred_source,
+                    allow_resample=False,
+                )
+                resampled = self._resample_minute_to_minutes(base_5m, target_minutes=15)
+                resampled = self._filter_by_datetime(resampled, start_date, end_date)
+                if resampled is not None and not resampled.empty:
+                    report("resample_5m", resampled)
+                    left_ok = self._minute_left_coverage_ok(resampled, start_datetime=start_date)
+                    if left_ok:
+                        candidates_df.append(("resample_5m", resampled))
+                    else:
+                        partial_candidates_df.append(("resample_5m", resampled))
+                        errors.append("resample_5m:left_gap")
+                    if left_ok and self._is_result_fresh_for_request_end(
+                        resampled,
+                        end_value=end_date,
+                        period=period,
+                        minute_mode=True,
+                    ):
+                        return resampled.reset_index(drop=True)
+            except Exception as exc:
+                errors.append(f"resample_5m:{exc}")
 
         # Final rescue: pull a raw minute window once and slice locally.
         window_sources: list[tuple[str, Callable[[], pd.DataFrame]]] = [
@@ -1522,20 +1963,26 @@ class DataService:
                     end_date=end_date,
                 )
                 if rescue_df is not None and not rescue_df.empty:
+                    report(window_name, rescue_df)
                     left_ok = self._minute_left_coverage_ok(rescue_df, start_datetime=start_date)
                     if left_ok:
                         candidates_df.append((window_name, rescue_df))
                     else:
                         partial_candidates_df.append((window_name, rescue_df))
                         errors.append(f"{window_name}:left_gap")
-                    if (not self._is_minute_tail_stale(rescue_df, end_datetime=end_date)) and left_ok:
+                    if left_ok and self._is_result_fresh_for_request_end(
+                        rescue_df,
+                        end_value=end_date,
+                        period=period,
+                        minute_mode=True,
+                    ):
                         return rescue_df.reset_index(drop=True)
                 else:
                     errors.append(f"{window_name}:sparse_result")
             except Exception as exc:
                 errors.append(f"{window_name}:{exc}")
 
-        final_candidates_df = candidates_df if candidates_df else partial_candidates_df
+        final_candidates_df = candidates_df + partial_candidates_df
         picked = self._pick_freshest_source_result(
             final_candidates_df,
             end_value=end_date,
@@ -1544,12 +1991,38 @@ class DataService:
             span_days=span_days,
             require_daily_valid=False,
         )
+        best_source: str | None = None
+        best_df: pd.DataFrame | None = None
         if picked is not None:
-            return picked[1].reset_index(drop=True)
-        for _, df in final_candidates_df:
-            if df is not None and not df.empty:
-                return df.reset_index(drop=True)
-        raise RuntimeError(" | ".join(errors))
+            best_source, best_df = picked[0], picked[1]
+        else:
+            for src, df in final_candidates_df:
+                if df is not None and not df.empty:
+                    best_source, best_df = src, df
+                    break
+        if best_df is None or best_df.empty:
+            raise RuntimeError(" | ".join(errors))
+
+        if not self._is_result_fresh_for_request_end(
+            best_df,
+            end_value=end_date,
+            period=period,
+            minute_mode=True,
+        ):
+            tail = self._series_tail_timestamp(best_df)
+            tail_text = tail.strftime("%Y-%m-%d %H:%M:%S") if tail is not None else "--"
+            detail_parts: list[str] = [
+                "stale_tail",
+                f"best={best_source or '--'}",
+                f"tail={tail_text}",
+                f"end={end_date}",
+                f"rows={len(best_df.index)}",
+            ]
+            detail_parts.extend(source_reports[:6])
+            detail_parts.extend(errors[:6])
+            raise RuntimeError("|".join(detail_parts))
+
+        return best_df.reset_index(drop=True)
 
     def _build_stock_minute_sources(
         self,
@@ -1702,11 +2175,14 @@ class DataService:
             else:
                 raw_symbol = f"sz{raw_symbol}"
         url = "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/kline/mkline"
-        params = {"param": f"{raw_symbol},m{mode},,640"}
+        # Add a cache-buster param to avoid intermediary/proxy caches freezing the window response.
+        params = {"param": f"{raw_symbol},m{mode},,640", "_": str(int(time.time() * 1000))}
         headers = {
             "User-Agent": "Mozilla/5.0",
             "Referer": "https://gu.qq.com/",
             "Accept": "application/json,text/plain,*/*",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
         }
         response = requests.get(url, params=params, headers=headers, timeout=15)
         response.raise_for_status()
@@ -2191,16 +2667,13 @@ class DataService:
                     if df is None or df.empty:
                         continue
                     col = "trade_date" if "trade_date" in df.columns else df.columns[0]
-                    ts = pd.to_datetime(df[col], errors="coerce").dropna().dt.normalize()
+                    ts = cls._normalize_trade_dates(df[col])
                     if ts.empty:
                         continue
-                    mn = pd.Timestamp(ts.min()).normalize()
-                    mx = pd.Timestamp(ts.max()).normalize()
                     now = pd.Timestamp.now().normalize()
-                    # Ignore synthetic weekday calendars that start too early or extend too far into the future.
-                    if mn < pd.Timestamp("1990-12-01"):
-                        continue
-                    if mx > (now + pd.Timedelta(days=370)):
+                    # Allow loading a stale-but-structurally-correct calendar so staleness guards can
+                    # still work around holidays when the calendar source is temporarily unavailable.
+                    if not cls._trade_dates_structure_ok(ts, now=now):
                         continue
                     cls._TRADE_DATES = set(ts.dt.strftime("%Y-%m-%d").tolist())
                     cls._TRADE_DATES_MAX_DAY = pd.Timestamp(ts.max()).normalize()
@@ -2402,6 +2875,19 @@ class DataService:
 
         checkpoint = cls._guard_checkpoint_minute(afternoon_end, now=now)
         return checkpoint.strftime("%Y%m%d%H%M")
+
+    @classmethod
+    def _minute_tail_lag_days(cls, df: pd.DataFrame, *, end_value: str) -> int | None:
+        if df is None or df.empty:
+            return None
+        tail_ts = cls._series_tail_timestamp(df)
+        end_ts = pd.to_datetime(end_value, errors="coerce")
+        if tail_ts is None or pd.isna(end_ts):
+            return None
+        try:
+            return int((pd.Timestamp(end_ts).normalize() - pd.Timestamp(tail_ts).normalize()).days)
+        except Exception:
+            return None
 
     @classmethod
     def _weekly_checkpoint(cls) -> str:
@@ -2645,6 +3131,11 @@ class DataService:
         tail_day = pd.Timestamp(tail_ts).normalize()
         if tail_day >= target_day:
             return True
+        # Calendar coverage guard: if the local calendar ends before target day, allow a small gap
+        # right after the last known calendar day to avoid false-stale during calendar outages.
+        if cls._TRADE_DATES_MAX_DAY is not None and target_day > cls._TRADE_DATES_MAX_DAY:
+            if tail_day <= cls._TRADE_DATES_MAX_DAY and (target_day - tail_day) <= pd.Timedelta(days=5):
+                return True
         # If request end is a holiday/weekend, previous trade day tail is acceptable.
         if not cls._is_trade_day(target_day):
             return tail_day >= cls._previous_trade_day(target_day).normalize()
@@ -2681,6 +3172,11 @@ class DataService:
             return gap <= pd.Timedelta(minutes=max(8, int(bar_minutes) * 2))
 
         # If request end falls on a non-trading day, previous trade day's close is acceptable.
+        # If the local calendar does not yet cover this day, avoid false-stale errors for short gaps
+        # immediately after the calendar's last known day (e.g. year-end holidays).
+        if cls._TRADE_DATES_MAX_DAY is not None and end_day > cls._TRADE_DATES_MAX_DAY:
+            if tail_day <= cls._TRADE_DATES_MAX_DAY and (end_day - tail_day) <= pd.Timedelta(days=5):
+                return True
         if not cls._is_trade_day(end_day):
             prev = cls._previous_trade_day(end_day).normalize()
             return tail_day >= prev
@@ -2885,6 +3381,65 @@ class DataService:
         out["日期"] = cls._parse_datetime_series(out["日期"]).dt.strftime("%Y-%m-%d")
         out = out.dropna(subset=["日期"]).reset_index(drop=True)
         return out
+
+    @classmethod
+    def _resample_minute_to_minutes(cls, df: pd.DataFrame, *, target_minutes: int) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        try:
+            target = max(1, int(target_minutes))
+        except Exception:
+            target = 15
+
+        _, ts = cls._extract_ts(df)
+        if ts is None:
+            return pd.DataFrame()
+        safe = df.copy()
+        safe["_dt_"] = ts
+        safe = safe.dropna(subset=["_dt_"])
+        if safe.empty:
+            return pd.DataFrame()
+        safe = safe.sort_values("_dt_", kind="stable")
+
+        open_col = cls._first_existing_column(safe, ("open", "开盘", "open_price", "开盘价"))
+        high_col = cls._first_existing_column(safe, ("high", "最高", "high_price", "最高价"))
+        low_col = cls._first_existing_column(safe, ("low", "最低", "low_price", "最低价"))
+        close_col = cls._first_existing_column(safe, ("close", "收盘", "收盘价", "latest", "现价"))
+        volume_col = cls._first_existing_column(safe, ("volume", "成交量", "vol"))
+        amount_col = cls._first_existing_column(safe, ("amount", "成交额", "turnover"))
+
+        if close_col is None:
+            return pd.DataFrame()
+
+        numeric_cols = [c for c in (open_col, high_col, low_col, close_col, volume_col, amount_col) if c is not None]
+        for col in numeric_cols:
+            safe[col] = pd.to_numeric(safe[col], errors="coerce")
+
+        # Group 5m/1m bars into target-minute bars, using end-time labeling semantics.
+        safe["_bin_"] = safe["_dt_"].dt.ceil(f"{target}min")
+        grouped = safe.groupby("_bin_", sort=True, observed=False)
+        open_source_col = open_col or close_col
+
+        out = pd.DataFrame(
+            {
+                "datetime": grouped["_dt_"].max(),
+                "open": grouped[open_source_col].apply(cls._first_valid),
+                "high": grouped[high_col].max() if high_col is not None else grouped[close_col].max(),
+                "low": grouped[low_col].min() if low_col is not None else grouped[close_col].min(),
+                "close": grouped[close_col].apply(cls._last_valid),
+            }
+        )
+        if volume_col is not None:
+            out["volume"] = grouped[volume_col].sum(min_count=1)
+        if amount_col is not None:
+            out["amount"] = grouped[amount_col].sum(min_count=1)
+
+        out = out.dropna(subset=["datetime", "close"])
+        if out.empty:
+            return pd.DataFrame()
+        out["datetime"] = cls._parse_datetime_series(out["datetime"]).dt.strftime("%Y-%m-%d %H:%M:%S")
+        out = out.dropna(subset=["datetime"]).drop_duplicates(subset=["datetime"], keep="last").sort_values("datetime")
+        return out.reset_index(drop=True)
 
     @staticmethod
     def _first_existing_column(df: pd.DataFrame, candidates: tuple[str, ...]) -> str | None:

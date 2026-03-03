@@ -29,27 +29,33 @@ class PreloadWorker(QObject):
             "trade_dates": False,
             "watch_spot": False,
         }
+        # Trade dates are a hard dependency for correctness (minute freshness checks).
+        # If it cannot be fetched from network within the time budget, abort initialization.
         try:
-            self.progress.emit(5, "初始化: 自选概要")
+            self.progress.emit(10, "初始化: 交易日历(网络)")
+            self._ensure_trade_dates_ready()
+            result["trade_dates"] = True
+        except Exception as exc:
+            errors.append(f"trade_dates:{exc}")
+            self.progress.emit(100, "初始化失败")
+            self.error.emit(" | ".join(errors))
+            self.finished.emit(result)
+            return
+
+        try:
+            self.progress.emit(55, "初始化: 股票列表")
+            self._ensure_symbol_list_ready()
+            result["symbols"] = True
+        except Exception as exc:
+            errors.append(f"symbols:{exc}")
+
+        try:
+            self.progress.emit(80, "初始化: 自选概要")
             self._update_watch_spot_snapshot()
             result["watch_spot"] = True
         except Exception as exc:
             # Best-effort only; main UI will refresh in background.
             warnings.append(f"watch_spot:{exc}")
-
-        try:
-            self.progress.emit(35, "初始化: 交易日历")
-            self._ensure_trade_dates_ready()
-            result["trade_dates"] = True
-        except Exception as exc:
-            errors.append(f"trade_dates:{exc}")
-
-        try:
-            self.progress.emit(65, "初始化: 股票列表")
-            self._ensure_symbol_list_ready()
-            result["symbols"] = True
-        except Exception as exc:
-            errors.append(f"symbols:{exc}")
 
         self.progress.emit(100, "初始化完成")
         if warnings:
@@ -143,10 +149,14 @@ class PreloadWorker(QObject):
             return
 
     def _ensure_trade_dates_ready(self) -> None:
-        if DataService._trade_dates_cache_needs_refresh():
-            DataService._refresh_trade_dates_cache_worker()
-        # Warm in-memory calendar.
-        DataService._load_trade_dates()
+        start = time.monotonic()
+        DataService._ensure_trade_dates_ready_sync(timeout_seconds=10.0)
+        elapsed = time.monotonic() - start
+        if elapsed > 10.0:
+            raise TimeoutError(f"交易日历获取超时: {elapsed:.1f}s")
+        dates = DataService._load_trade_dates()
+        if (not dates) or (DataService._TRADE_DATES_MAX_DAY is None):
+            raise RuntimeError("交易日历为空或无法确定最大日期（trade_dates not ready）")
 
     @staticmethod
     def _call_with_timeout(loader, timeout_seconds: float) -> object | None:
