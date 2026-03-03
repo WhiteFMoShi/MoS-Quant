@@ -83,7 +83,11 @@ class UnifiedDataModule:
         if in_index_pool and not in_stock_pool:
             return "index_daily"
 
-        # Ambiguous code (e.g. 000001): default to stock for user-entered stock symbols.
+        # Ambiguous code (e.g. 000001): keep current dataset choice if possible.
+        if in_stock_pool and in_index_pool and fallback in {"stock_daily", "index_daily"}:
+            return fallback
+
+        # Backward-compatible fallback for ambiguous symbols.
         if in_stock_pool:
             return "stock_daily"
 

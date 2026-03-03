@@ -6,14 +6,17 @@ from datetime import datetime
 import hashlib
 import json
 from pathlib import Path
+import threading
 import time
 from typing import Callable
 
 import akshare as ak
 import pandas as pd
+import requests
 from requests.exceptions import RequestException
 
 from core.cache_paths import cache_root, legacy_cache_roots
+from core.parquet_compat import has_parquet_engine
 from core.series_cache_manager import SeriesCacheManager
 from core.timeseries_cache import TimeSeriesCache
 
@@ -46,6 +49,9 @@ class DataService:
     DAILY_CLOSE_READY_HOUR = 15
     DAILY_CLOSE_READY_MINUTE = 5
     _TRADE_DATES: set[str] | None = None
+    _TRADE_DATES_MAX_DAY: pd.Timestamp | None = None
+    _TRADE_DATES_REFRESHING: bool = False
+    CHECKPOINT_MAX_LAG_DAYS = 45
 
     def __init__(self, cache_dir: Path | None = None) -> None:
         self._cache_dir = cache_dir or (cache_root() / "datasets")
@@ -53,6 +59,125 @@ class DataService:
         self._series_cache = SeriesCacheManager(self._cache_dir)
         self._adopt_legacy_cache_files("datasets")
         self._cleanup_obsolete_series_cache_files()
+        self._ensure_trade_dates_cache_refresh()
+
+    def _ensure_trade_dates_cache_refresh(self) -> None:
+        if DataService._TRADE_DATES_REFRESHING:
+            return
+        if not DataService._trade_dates_cache_needs_refresh():
+            return
+        DataService._TRADE_DATES_REFRESHING = True
+        threading.Thread(target=DataService._refresh_trade_dates_cache_worker, daemon=True).start()
+
+    @classmethod
+    def _trade_dates_cache_needs_refresh(cls) -> bool:
+        market_dir = cache_root() / "market"
+        pickle_path = market_dir / "trade_dates.pkl"
+        parquet_path = market_dir / "trade_dates.parquet"
+        candidates: list[Path] = []
+        if pickle_path.exists():
+            candidates.append(pickle_path)
+        if parquet_path.exists() and has_parquet_engine():
+            candidates.append(parquet_path)
+        if not candidates:
+            return True
+        for path in candidates:
+            try:
+                df = pd.read_parquet(path) if path.suffix == ".parquet" else pd.read_pickle(path)
+            except Exception:
+                continue
+            if df is None or df.empty:
+                continue
+            col = "trade_date" if "trade_date" in df.columns else df.columns[0]
+            ts = pd.to_datetime(df[col], errors="coerce").dropna()
+            if ts.empty:
+                continue
+            now = pd.Timestamp.now().normalize()
+            ts_min = pd.Timestamp(ts.min()).normalize()
+            ts_max = pd.Timestamp(ts.max()).normalize()
+            # Weekday-generated placeholders tend to start at 1990-01-01 and extend years into the future.
+            if ts_min < pd.Timestamp("1990-12-01"):
+                return True
+            if ts_max > (now + pd.Timedelta(days=370)):
+                return True
+            return False
+        return True
+
+    @classmethod
+    def _refresh_trade_dates_cache_worker(cls) -> None:
+        try:
+            def call_with_timeout(loader: object, timeout_seconds: float = 12.0) -> pd.DataFrame:
+                payload: dict[str, object] = {}
+                error: dict[str, Exception] = {}
+
+                def runner() -> None:
+                    try:
+                        payload["df"] = loader()
+                    except Exception as exc:
+                        error["exc"] = exc
+
+                t = threading.Thread(target=runner, daemon=True)
+                t.start()
+                t.join(timeout=max(0.5, float(timeout_seconds)))
+                if t.is_alive():
+                    raise TimeoutError("timeout")
+                if "exc" in error:
+                    raise error["exc"]
+                df = payload.get("df")
+                if not isinstance(df, pd.DataFrame):
+                    return pd.DataFrame()
+                return df
+
+            loaders = (
+                ("sina_trade_calendar", lambda: ak.tool_trade_date_hist_sina()),
+                ("tencent_index_daily_calendar", lambda: ak.stock_zh_index_daily_tx(symbol="sh000001")),
+                ("sina_index_daily_calendar", lambda: ak.stock_zh_index_daily(symbol="sh000001")),
+            )
+            ts = pd.Series(dtype="datetime64[ns]")
+            for _, loader in loaders:
+                try:
+                    df = call_with_timeout(loader, timeout_seconds=12.0)
+                except Exception:
+                    continue
+                if df is None or df.empty:
+                    continue
+                col = None
+                for candidate in ("trade_date", "date", "日期", "datetime", "时间", "day"):
+                    if candidate in df.columns:
+                        col = candidate
+                        break
+                if col is None:
+                    col = df.columns[0]
+                ts = pd.to_datetime(df[col], errors="coerce").dropna().dt.normalize()
+                if not ts.empty:
+                    break
+            if ts.empty:
+                return
+            dates = sorted(set(ts.dt.strftime("%Y-%m-%d").tolist()))
+            if len(dates) < 2000:
+                return
+            market_dir = cache_root() / "market"
+            market_dir.mkdir(parents=True, exist_ok=True)
+            pickle_path = market_dir / "trade_dates.pkl"
+            parquet_path = market_dir / "trade_dates.parquet"
+            cache_df = pd.DataFrame({"trade_date": pd.Series(dates, dtype="object")})
+            try:
+                cache_df.to_pickle(pickle_path)
+            except Exception:
+                pass
+            if has_parquet_engine():
+                try:
+                    cache_df.to_parquet(parquet_path, index=False)
+                except Exception:
+                    try:
+                        if parquet_path.exists():
+                            parquet_path.unlink()
+                    except Exception:
+                        pass
+            cls._TRADE_DATES = None
+            cls._TRADE_DATES_MAX_DAY = None
+        finally:
+            cls._TRADE_DATES_REFRESHING = False
 
     def fetch(
         self,
@@ -93,11 +218,12 @@ class DataService:
             title = f"{title_prefix} {symbol} {start}-{end}"
             params["start_date"] = start
             params["end_date"] = end
-            fetcher: Callable[[str, str], pd.DataFrame] = lambda s, e: self._fetch_stock_minute(
+            fetcher = lambda s, e: self._fetch_stock_minute(
                 symbol=symbol,
                 start_date=s,
                 end_date=e,
                 period=period,
+                preferred_source=None,
             )
             minute_mode = True
         else:
@@ -212,11 +338,12 @@ class DataService:
             title = f"{title_prefix} {symbol} {start}-{end}"
             params["start_date"] = start
             params["end_date"] = end
-            fetcher: Callable[[str, str], pd.DataFrame] = lambda s, e: self._fetch_index_minute(
+            fetcher = lambda s, e: self._fetch_index_minute(
                 symbol=symbol,
                 start_date=s,
                 end_date=e,
                 period=period,
+                preferred_source=None,
             )
             minute_mode = True
         else:
@@ -298,8 +425,10 @@ class DataService:
         cached_path: Path | None = None
         span_days = self._range_span_days(start_value, end_value, minute_mode)
         validate_daily = (not minute_mode) and (request.period == "daily")
+        period_mode = self._normalize_period(str(params.get("period", request.period or "daily")))
         range_start_value = start_value
         fresh_hash = self._series_fresh_hash(params, minute_mode)
+        force_tail_refresh_due_stale = False
         if not request.force_refresh:
             meta = self._series_cache.load_meta(params)
             if meta is not None and str(meta.get("fresh_hash", "")) == fresh_hash:
@@ -307,14 +436,29 @@ class DataService:
                 if not cached_df.empty:
                     filtered = self._series_cache.filter_by_range(cached_df, range_start_value, end_value, minute_mode)
                     covered = self._series_cache.covers_range(cached_df, range_start_value, end_value, minute_mode)
-                    if covered and ((not validate_daily) or self._is_valid_daily_series(filtered, span_days)):
-                        self._emit_progress(progress_cb, 100, "命中缓存(hash)")
-                        return FetchResponse(
-                            title=title,
-                            dataframe=filtered,
-                            cache_path=str(cached_path if cached_path is not None else (parquet_path if parquet_path.exists() else pickle_path)),
-                            from_cache=True,
-                        )
+                    fresh_enough = self._is_result_fresh_for_request_end(
+                        filtered,
+                        end_value=end_value,
+                        period=period_mode,
+                        minute_mode=minute_mode,
+                    )
+                    if covered and ((not validate_daily) or self._is_valid_daily_series(filtered, span_days)) and fresh_enough:
+                        if minute_mode and not self._minute_left_coverage_ok(filtered, start_datetime=start_value):
+                            self._emit_progress(progress_cb, 8, "缓存左侧缺口，继续增量")
+                        else:
+                            self._emit_progress(progress_cb, 100, "命中缓存(hash)")
+                            return FetchResponse(
+                                title=title,
+                                dataframe=filtered,
+                                cache_path=str(
+                                    cached_path
+                                    if cached_path is not None
+                                    else (parquet_path if parquet_path.exists() else pickle_path)
+                                ),
+                                from_cache=True,
+                            )
+                    if covered and not fresh_enough:
+                        self._emit_progress(progress_cb, 8, "缓存末端落后，继续增量")
             if cached_df.empty:
                 cached_df, cached_path = self._series_cache.load(params, minute_mode)
             if self._is_sparse_result(cached_df, span_days, minute_mode):
@@ -330,45 +474,105 @@ class DataService:
         if not request.force_refresh and not cached_df.empty:
             if self._series_cache.covers_range(cached_df, range_start_value, end_value, minute_mode):
                 filtered = self._series_cache.filter_by_range(cached_df, range_start_value, end_value, minute_mode)
-                if (not validate_daily) or self._is_valid_daily_series(filtered, span_days):
-                    self._emit_progress(progress_cb, 100, "命中缓存")
-                    return FetchResponse(
-                        title=title,
-                        dataframe=filtered,
-                        cache_path=str(cached_path if cached_path is not None else (parquet_path if parquet_path.exists() else pickle_path)),
-                        from_cache=True,
-                    )
-                force_full_refresh_due_invalid_daily = True
-                self._emit_progress(progress_cb, 12, "缓存覆盖但质量不足，准备修复")
+                fresh_enough = self._is_result_fresh_for_request_end(
+                    filtered,
+                    end_value=end_value,
+                    period=period_mode,
+                    minute_mode=minute_mode,
+                )
+                if ((not validate_daily) or self._is_valid_daily_series(filtered, span_days)) and fresh_enough:
+                    if minute_mode and not self._minute_left_coverage_ok(filtered, start_datetime=start_value):
+                        self._emit_progress(progress_cb, 12, "缓存左侧缺口，准备修复")
+                    else:
+                        self._emit_progress(progress_cb, 100, "命中缓存")
+                        return FetchResponse(
+                            title=title,
+                            dataframe=filtered,
+                            cache_path=str(
+                                cached_path
+                                if cached_path is not None
+                                else (parquet_path if parquet_path.exists() else pickle_path)
+                            ),
+                            from_cache=True,
+                        )
+                if not fresh_enough:
+                    self._emit_progress(progress_cb, 12, "缓存覆盖但末端落后，准备更新")
+                    force_tail_refresh_due_stale = True
+                else:
+                    force_full_refresh_due_invalid_daily = True
+                    self._emit_progress(progress_cb, 12, "缓存覆盖但质量不足，准备修复")
 
         fetched_parts: list[pd.DataFrame] = []
         fetch_failures: list[str] = []
         ranges_to_fetch: list[tuple[str, str]]
         if request.force_refresh or cached_df.empty or force_full_refresh_due_invalid_daily:
             ranges_to_fetch = [(start_value, end_value)]
+        elif force_tail_refresh_due_stale:
+            ranges_to_fetch = self._build_tail_update_ranges(
+                cached_df=cached_df,
+                end_value=end_value,
+                minute_mode=minute_mode,
+            )
+            if not ranges_to_fetch:
+                filtered = self._series_cache.filter_by_range(cached_df, start_value, end_value, minute_mode)
+                self._emit_progress(progress_cb, 100, "命中缓存")
+                return FetchResponse(
+                    title=title,
+                    dataframe=filtered,
+                    cache_path=str(cached_path if cached_path is not None else (parquet_path if parquet_path.exists() else pickle_path)),
+                    from_cache=True,
+                )
+            self._emit_progress(progress_cb, 14, "执行末端增量更新")
         else:
             ranges = self._series_cache.missing_ranges(cached_df, range_start_value, end_value, minute_mode)
             if not ranges:
                 filtered = self._series_cache.filter_by_range(cached_df, range_start_value, end_value, minute_mode)
-                if (not validate_daily) or self._is_valid_daily_series(filtered, span_days):
-                    self._emit_progress(progress_cb, 100, "命中缓存")
-                    return FetchResponse(
-                        title=title,
-                        dataframe=filtered,
-                        cache_path=str(cached_path if cached_path is not None else (parquet_path if parquet_path.exists() else pickle_path)),
-                        from_cache=True,
-                    )
-                ranges_to_fetch = [(start_value, end_value)]
-                self._emit_progress(progress_cb, 14, "缓存完整但质量不足，执行全区间修复")
+                fresh_enough = self._is_result_fresh_for_request_end(
+                    filtered,
+                    end_value=end_value,
+                    period=period_mode,
+                    minute_mode=minute_mode,
+                )
+                if ((not validate_daily) or self._is_valid_daily_series(filtered, span_days)) and fresh_enough:
+                    if minute_mode and not self._minute_left_coverage_ok(filtered, start_datetime=start_value):
+                        ranges_to_fetch = [(start_value, end_value)]
+                        self._emit_progress(progress_cb, 14, "缓存左侧缺口，执行全区间修复")
+                    else:
+                        self._emit_progress(progress_cb, 100, "命中缓存")
+                        return FetchResponse(
+                            title=title,
+                            dataframe=filtered,
+                            cache_path=str(
+                                cached_path
+                                if cached_path is not None
+                                else (parquet_path if parquet_path.exists() else pickle_path)
+                            ),
+                            from_cache=True,
+                        )
+                else:
+                    ranges_to_fetch = [(start_value, end_value)]
+                    self._emit_progress(progress_cb, 14, "缓存完整但质量不足，执行全区间修复")
             else:
                 ranges_to_fetch = ranges
 
         if minute_mode:
             expanded: list[tuple[str, str]] = []
-            chunk_days = 20 if (span_days is None or span_days <= 240) else 45
+            chunk_days = self._minute_chunk_days(
+                period=period_mode,
+                span_days=span_days,
+                has_cache=not cached_df.empty,
+            )
             for start_text, end_text in ranges_to_fetch:
-                expanded.extend(self._split_minute_ranges(start_text, end_text, chunk_days=chunk_days))
-            ranges_to_fetch = expanded
+                expanded.extend(
+                    self._split_minute_ranges(
+                        start_text,
+                        end_text,
+                        chunk_days=chunk_days,
+                        period=period_mode,
+                    )
+                )
+            # Prioritize recent chunks first to maximize probability of getting latest tail.
+            ranges_to_fetch = list(reversed(expanded))
 
         total = len(ranges_to_fetch)
         if total > 0 and not cached_df.empty:
@@ -382,12 +586,18 @@ class DataService:
             self._emit_progress(progress_cb, phase, label)
             quick_incremental = (not request.force_refresh) and (not cached_df.empty)
             try:
+                if minute_mode:
+                    retries = 2 if quick_incremental else 3
+                    delay_seconds = 0.3 if quick_incremental else 0.6
+                else:
+                    retries = 1 if quick_incremental else 3
+                    delay_seconds = 0.2 if quick_incremental else 0.8
                 fetched_parts.append(
                     self._call_with_retry(
                         fetch_func=lambda s=start_text, e=end_text: fetch_range_func(s, e),
                         action_name=f"{action_name} {start_text}-{end_text}",
-                        retries=1 if quick_incremental else (2 if minute_mode else 3),
-                        delay_seconds=0.2 if quick_incremental else (0.6 if minute_mode else 0.8),
+                        retries=retries,
+                        delay_seconds=delay_seconds,
                         progress_cb=progress_cb,
                         progress_percent=phase,
                         task_label=(f"区间{idx}/{total}" if total > 1 else "主区间"),
@@ -395,7 +605,9 @@ class DataService:
                 )
             except Exception as exc:
                 fetch_failures.append(str(exc))
-                if cached_df.empty:
+                if cached_df.empty and (not minute_mode):
+                    raise
+                if cached_df.empty and minute_mode and total <= 1:
                     raise
         self._emit_progress(progress_cb, 72, "区间下载完成")
 
@@ -403,11 +615,18 @@ class DataService:
         if merged.empty and not cached_df.empty:
             merged = cached_df
         filtered = self._series_cache.filter_by_range(merged, start_value, end_value, minute_mode)
+        if filtered.empty and (not minute_mode) and (merged is not None) and (not merged.empty):
+            # Some upstream tables use unexpected date column names/formats and may be excluded by strict range filter.
+            # Keep usable non-minute payload instead of hard-failing the whole request.
+            filtered = merged.reset_index(drop=True)
 
         needs_repair = self._is_sparse_result(filtered, span_days, minute_mode) or (
             validate_daily and (not self._is_valid_daily_series(filtered, span_days))
         )
         attempt_repair = needs_repair
+        if minute_mode and fetch_failures and ((not cached_df.empty) or (not filtered.empty)):
+            # Keep fast path when we already have usable minute data from cache or fetched parts.
+            attempt_repair = False
         if attempt_repair:
             # Avoid heavy full-range re-download when cache is already usable.
             if (not request.force_refresh) and (not cached_df.empty) and (not filtered.empty):
@@ -433,10 +652,14 @@ class DataService:
                 self._emit_progress(progress_cb, 78, "尝试全量修复")
                 if minute_mode and span_days is not None and span_days > 180:
                     raise RuntimeError("minute_range_too_large")
+                repair_retries = 1 if minute_mode else 2
+                if minute_mode and cached_df.empty and filtered.empty:
+                    # All minute chunks failed with no usable payload; allow one extra rescue retry.
+                    repair_retries = 2
                 repaired = self._call_with_retry(
                     fetch_func=lambda: fetch_range_func(start_value, end_value),
                     action_name=f"{action_name} 全量修复",
-                    retries=1 if minute_mode else 2,
+                    retries=repair_retries,
                     delay_seconds=0.6 if minute_mode else 0.8,
                     progress_cb=progress_cb,
                     progress_percent=78,
@@ -453,13 +676,61 @@ class DataService:
             self._emit_progress(progress_cb, 80, "跳过全量修复(缓存优先)")
 
         if filtered.empty and not cached_df.empty and fetch_failures:
-            # Missing range can be all non-trading days; prefer stale-but-usable cache.
-            filtered = self._series_cache.filter_by_range(cached_df, start_value, end_value, minute_mode)
+            cached_filtered = self._series_cache.filter_by_range(cached_df, start_value, end_value, minute_mode)
+            if self._is_result_fresh_for_request_end(
+                cached_filtered,
+                end_value=end_value,
+                period=period_mode,
+                minute_mode=minute_mode,
+            ):
+                filtered = cached_filtered
+                merged = cached_df
+                self._emit_progress(progress_cb, 84, "网络失败，回退新鲜缓存")
+            else:
+                detail = " | ".join(fetch_failures) if fetch_failures else "stale_tail"
+                raise RuntimeError(f"all_sources_stale|{detail}")
+        if filtered.empty and cached_df.empty and fetch_failures:
+            detail = " | ".join(fetch_failures)
+            raise RuntimeError(detail)
 
         if validate_daily and not self._is_valid_daily_series(filtered, span_days):
             if not cached_df.empty and self._is_valid_daily_series(cached_df, span_days):
-                filtered = self._series_cache.filter_by_range(cached_df, start_value, end_value, minute_mode)
-                merged = cached_df
+                cached_filtered = self._series_cache.filter_by_range(cached_df, start_value, end_value, minute_mode)
+                if self._is_result_fresh_for_request_end(
+                    cached_filtered,
+                    end_value=end_value,
+                    period=period_mode,
+                    minute_mode=minute_mode,
+                ):
+                    filtered = cached_filtered
+                    merged = cached_df
+
+        if not filtered.empty:
+            fresh_enough = self._is_result_fresh_for_request_end(
+                filtered,
+                end_value=end_value,
+                period=period_mode,
+                minute_mode=minute_mode,
+            )
+            if not fresh_enough:
+                if not cached_df.empty:
+                    cached_filtered = self._series_cache.filter_by_range(cached_df, start_value, end_value, minute_mode)
+                    if self._is_result_fresh_for_request_end(
+                        cached_filtered,
+                        end_value=end_value,
+                        period=period_mode,
+                        minute_mode=minute_mode,
+                    ):
+                        filtered = cached_filtered
+                        merged = cached_df
+                        fresh_enough = True
+            if not fresh_enough:
+                if minute_mode:
+                    # Minute endpoints are often delayed; keep best-effort payload instead of hard failing.
+                    self._emit_progress(progress_cb, 86, "分钟数据末端滞后(允许展示)")
+                else:
+                    detail = " | ".join(fetch_failures) if fetch_failures else "stale_tail"
+                    raise RuntimeError(f"all_sources_stale|{detail}")
 
         self._emit_progress(progress_cb, 88, "合并缓存")
         changed = self._series_cache.dataframe_changed(cached_df, merged)
@@ -556,6 +827,47 @@ class DataService:
         errors: list[str] = []
         span_days = self._range_span_days(start_date, end_date, minute_mode=False)
         candidates: list[tuple[str, pd.DataFrame]] = []
+        tried_sina_daily = False
+
+        # Fast path: Sina daily is usually much faster than eastmoney full-history pagination.
+        try:
+            tried_sina_daily = True
+            self._emit_progress(progress_cb, 30, f"网络任务: 新浪日线 {prefixed_symbol} 快速探测")
+            sina_daily = self._fetch_stock_daily_sina_safe(
+                symbol=prefixed_symbol,
+                start_date=start_date,
+                end_date=end_date,
+                adjust="qfq",
+                progress_cb=None,
+            )
+            if period == "daily":
+                if sina_daily is not None and not sina_daily.empty:
+                    candidates.append(("sina", sina_daily))
+                    if self._is_result_fresh_for_request_end(
+                        sina_daily,
+                        end_value=end_date,
+                        period="daily",
+                        minute_mode=False,
+                    ) and self._is_valid_daily_series(sina_daily, span_days):
+                        return sina_daily.reset_index(drop=True)
+            else:
+                sina_resampled = self._resample_daily_to_period(
+                    self._filter_by_date(sina_daily, start_date, end_date),
+                    period=period,
+                )
+                if sina_resampled is not None and not sina_resampled.empty:
+                    candidates.append(("sina_resampled", sina_resampled))
+                    if self._is_result_fresh_for_request_end(
+                        sina_resampled,
+                        end_value=end_date,
+                        period=period,
+                        minute_mode=False,
+                    ):
+                        return sina_resampled.reset_index(drop=True)
+                else:
+                    errors.append("sina_resampled:sparse_result")
+        except Exception as exc:
+            errors.append(f"sina:{exc}")
 
         try:
             self._emit_progress(progress_cb, 32, f"网络任务: 东财日线 {symbol} 任务15%")
@@ -568,27 +880,53 @@ class DataService:
             )
             if df is not None and not df.empty:
                 candidates.append(("eastmoney", df))
+                if self._is_result_fresh_for_request_end(
+                    df,
+                    end_value=end_date,
+                    period=period,
+                    minute_mode=False,
+                ):
+                    if period != "daily" or self._is_valid_daily_series(df, span_days):
+                        return df.reset_index(drop=True)
             else:
                 errors.append("eastmoney:sparse_result")
         except Exception as exc:
             errors.append(f"eastmoney:{exc}")
 
         if period != "daily":
+            # Fast path: only use eastmoney daily for resample first.
+            try:
+                self._emit_progress(progress_cb, 35, f"网络任务: 东财日线重采样{period}")
+                em_daily = ak.stock_zh_a_hist(
+                    symbol=symbol,
+                    period="daily",
+                    start_date=start_date,
+                    end_date=end_date,
+                    adjust="qfq",
+                )
+                em_resampled = self._resample_daily_to_period(
+                    self._filter_by_date(em_daily, start_date, end_date),
+                    period=period,
+                )
+                if em_resampled is not None and not em_resampled.empty:
+                    candidates.append(("eastmoney_resampled", em_resampled))
+                    if self._is_result_fresh_for_request_end(
+                        em_resampled,
+                        end_value=end_date,
+                        period=period,
+                        minute_mode=False,
+                    ):
+                        return em_resampled.reset_index(drop=True)
+                else:
+                    errors.append("eastmoney_resampled:sparse_result")
+            except Exception as exc:
+                errors.append(f"eastmoney_resampled:{exc}")
+
             resampled = self._fetch_non_daily_from_daily_sources(
                 period=period,
                 start_date=start_date,
                 end_date=end_date,
                 loaders=[
-                    (
-                        "eastmoney_daily",
-                        lambda: ak.stock_zh_a_hist(
-                            symbol=symbol,
-                            period="daily",
-                            start_date=start_date,
-                            end_date=end_date,
-                            adjust="qfq",
-                        ),
-                    ),
                     (
                         "sina",
                         lambda: self._fetch_stock_daily_sina_safe(
@@ -628,31 +966,36 @@ class DataService:
                     return df.reset_index(drop=True)
             raise RuntimeError(" | ".join(errors))
 
-        self._emit_progress(progress_cb, 34, f"网络任务: 多源并行日线 {prefixed_symbol} 任务55%")
+        self._emit_progress(progress_cb, 34, f"网络任务: 日线补充源 {prefixed_symbol}")
+        fallback_tasks: list[tuple[str, Callable[[], pd.DataFrame]]] = []
+        if not tried_sina_daily:
+            fallback_tasks.append(
+                (
+                    "sina",
+                    lambda: self._fetch_stock_daily_sina_safe(
+                        symbol=prefixed_symbol,
+                        start_date=start_date,
+                        end_date=end_date,
+                        adjust="qfq",
+                        progress_cb=None,
+                    ),
+                )
+            )
+        fallback_tasks.append(
+            (
+                "tencent",
+                lambda: self._fetch_stock_daily_tx_safe(
+                    symbol=prefixed_symbol,
+                    start_date=start_date,
+                    end_date=end_date,
+                    adjust="qfq",
+                    progress_cb=None,
+                ),
+            )
+        )
         candidates.extend(
             self._run_parallel_dataframe_tasks(
-                [
-                    (
-                        "sina",
-                        lambda: self._fetch_stock_daily_sina_safe(
-                            symbol=prefixed_symbol,
-                            start_date=start_date,
-                            end_date=end_date,
-                            adjust="qfq",
-                            progress_cb=None,
-                        ),
-                    ),
-                    (
-                        "tencent",
-                        lambda: self._fetch_stock_daily_tx_safe(
-                            symbol=prefixed_symbol,
-                            start_date=start_date,
-                            end_date=end_date,
-                            adjust="qfq",
-                            progress_cb=None,
-                        ),
-                    ),
-                ],
+                fallback_tasks,
                 errors,
                 max_workers=2,
             )
@@ -762,6 +1105,42 @@ class DataService:
         errors: list[str] = []
         span_days = self._range_span_days(start_date, end_date, minute_mode=False)
         candidates: list[tuple[str, pd.DataFrame]] = []
+        tried_sina_daily = False
+
+        # Fast path for index daily: Sina is usually very fast and returns full history directly.
+        try:
+            tried_sina_daily = True
+            self._emit_progress(progress_cb, 30, f"网络任务: 新浪指数 {prefixed_symbol} 快速探测")
+            sina_daily = self._filter_by_date(
+                ak.stock_zh_index_daily(symbol=prefixed_symbol),
+                start_date,
+                end_date,
+            )
+            if period == "daily":
+                if sina_daily is not None and not sina_daily.empty:
+                    candidates.append(("sina", sina_daily))
+                    if self._is_result_fresh_for_request_end(
+                        sina_daily,
+                        end_value=end_date,
+                        period="daily",
+                        minute_mode=False,
+                    ) and self._is_valid_daily_series(sina_daily, span_days):
+                        return sina_daily.reset_index(drop=True)
+            else:
+                sina_resampled = self._resample_daily_to_period(sina_daily, period=period)
+                if sina_resampled is not None and not sina_resampled.empty:
+                    candidates.append(("sina_resampled", sina_resampled))
+                    if self._is_result_fresh_for_request_end(
+                        sina_resampled,
+                        end_value=end_date,
+                        period=period,
+                        minute_mode=False,
+                    ):
+                        return sina_resampled.reset_index(drop=True)
+                else:
+                    errors.append("sina_resampled:sparse_result")
+        except Exception as exc:
+            errors.append(f"sina:{exc}")
 
         try:
             self._emit_progress(progress_cb, 32, f"网络任务: 东财指数 {symbol} 任务15%")
@@ -773,34 +1152,52 @@ class DataService:
             )
             if df is not None and not df.empty:
                 candidates.append(("eastmoney", df))
+                if self._is_result_fresh_for_request_end(
+                    df,
+                    end_value=end_date,
+                    period=period,
+                    minute_mode=False,
+                ):
+                    if period != "daily" or self._is_valid_daily_series(df, span_days):
+                        return df.reset_index(drop=True)
             else:
                 errors.append("eastmoney:sparse_result")
         except Exception as exc:
             errors.append(f"eastmoney:{exc}")
 
         if period != "daily":
+            # Fast path: only use eastmoney daily for resample first.
+            try:
+                self._emit_progress(progress_cb, 35, f"网络任务: 东财指数重采样{period}")
+                em_daily = ak.index_zh_a_hist(
+                    symbol=symbol,
+                    period="daily",
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+                em_resampled = self._resample_daily_to_period(
+                    self._filter_by_date(em_daily, start_date, end_date),
+                    period=period,
+                )
+                if em_resampled is not None and not em_resampled.empty:
+                    candidates.append(("eastmoney_resampled", em_resampled))
+                    if self._is_result_fresh_for_request_end(
+                        em_resampled,
+                        end_value=end_date,
+                        period=period,
+                        minute_mode=False,
+                    ):
+                        return em_resampled.reset_index(drop=True)
+                else:
+                    errors.append("eastmoney_resampled:sparse_result")
+            except Exception as exc:
+                errors.append(f"eastmoney_resampled:{exc}")
+
             resampled = self._fetch_non_daily_from_daily_sources(
                 period=period,
                 start_date=start_date,
                 end_date=end_date,
                 loaders=[
-                    (
-                        "eastmoney_daily",
-                        lambda: ak.index_zh_a_hist(
-                            symbol=symbol,
-                            period="daily",
-                            start_date=start_date,
-                            end_date=end_date,
-                        ),
-                    ),
-                    (
-                        "sina",
-                        lambda: self._filter_by_date(
-                            ak.stock_zh_index_daily(symbol=prefixed_symbol),
-                            start_date,
-                            end_date,
-                        ),
-                    ),
                     (
                         "tencent",
                         lambda: self._filter_by_date(
@@ -830,27 +1227,32 @@ class DataService:
                     return df.reset_index(drop=True)
             raise RuntimeError(" | ".join(errors))
 
-        self._emit_progress(progress_cb, 34, f"网络任务: 多源并行指数 {prefixed_symbol} 任务55%")
+        self._emit_progress(progress_cb, 34, f"网络任务: 指数日线补充源 {prefixed_symbol}")
+        fallback_tasks: list[tuple[str, Callable[[], pd.DataFrame]]] = []
+        if not tried_sina_daily:
+            fallback_tasks.append(
+                (
+                    "sina",
+                    lambda: self._filter_by_date(
+                        ak.stock_zh_index_daily(symbol=prefixed_symbol),
+                        start_date,
+                        end_date,
+                    ),
+                )
+            )
+        fallback_tasks.append(
+            (
+                "tencent",
+                lambda: self._filter_by_date(
+                    ak.stock_zh_index_daily_tx(symbol=prefixed_symbol),
+                    start_date,
+                    end_date,
+                ),
+            )
+        )
         candidates.extend(
             self._run_parallel_dataframe_tasks(
-                [
-                    (
-                        "sina",
-                        lambda: self._filter_by_date(
-                            ak.stock_zh_index_daily(symbol=prefixed_symbol),
-                            start_date,
-                            end_date,
-                        ),
-                    ),
-                    (
-                        "tencent",
-                        lambda: self._filter_by_date(
-                            ak.stock_zh_index_daily_tx(symbol=prefixed_symbol),
-                            start_date,
-                            end_date,
-                        ),
-                    ),
-                ],
+                fallback_tasks,
                 errors,
                 max_workers=2,
             )
@@ -877,51 +1279,58 @@ class DataService:
         start_date: str,
         end_date: str,
         period: str,
+        preferred_source: str | None = None,
     ) -> pd.DataFrame:
         errors: list[str] = []
         span_days = self._range_span_days(start_date, end_date, minute_mode=True)
-        quote_symbol = self._normalize_stock_symbol(symbol)
-        tasks: list[tuple[str, Callable[[], pd.DataFrame]]] = [
-            (
-                "eastmoney_min",
-                lambda: self._filter_by_datetime(
-                    ak.stock_zh_a_hist_min_em(
-                        symbol=symbol,
-                        start_date=start_date,
-                        end_date=end_date,
-                        period=period,
-                        adjust="",
-                    ),
-                    start_date,
-                    end_date,
-                ),
-            ),
-            (
-                "eastmoney_rv",
-                lambda: self._filter_by_datetime(
-                    ak.rv_from_stock_zh_a_hist_min_em(
-                        symbol=symbol,
-                        start_date=start_date,
-                        end_date=end_date,
-                        period=period,
-                        adjust="hfq",
-                    ),
-                    start_date,
-                    end_date,
-                ),
-            ),
-            (
-                "sina_min",
-                lambda: (
-                    lambda df: self._filter_by_datetime(
-                        (df.rename(columns={"day": "datetime"}) if (df is not None and hasattr(df, "columns") and "day" in df.columns) else df),
-                        start_date,
-                        end_date,
-                    )
-                )(ak.stock_zh_a_minute(symbol=quote_symbol, period=period, adjust="")),
-            ),
+        sources = self._build_stock_minute_sources(symbol=symbol, period=period)
+        ordered_names = list(sources.keys())
+        if preferred_source in sources:
+            ordered_names = [str(preferred_source)] + [n for n in ordered_names if n != preferred_source]
+
+        # Sequential fallback is more stable than multi-source parallel burst for minute endpoints.
+        candidates: list[tuple[str, pd.DataFrame]] = []
+        for name in ordered_names:
+            try:
+                df = sources[name](start_date, end_date)
+            except Exception as exc:
+                errors.append(f"{name}:{exc}")
+                continue
+            if df is None or df.empty:
+                errors.append(f"{name}:sparse_result")
+                continue
+            candidates.append((name, df))
+            if (not self._is_minute_tail_stale(df, end_datetime=end_date)) and self._minute_left_coverage_ok(
+                df,
+                start_datetime=start_date,
+            ):
+                return df.reset_index(drop=True)
+
+        # Final rescue: pull a raw minute window once and slice locally.
+        # This avoids chunk-level repeated failures causing complete request failure.
+        window_sources: list[tuple[str, Callable[[], pd.DataFrame]]] = [
+            ("tx_window", lambda: self._fetch_stock_minute_window_tx(symbol=symbol, period=period)),
+            ("sina_window", lambda: self._fetch_stock_minute_window(symbol=symbol, period=period)),
         ]
-        candidates = self._run_parallel_dataframe_tasks(tasks, errors, max_workers=3)
+        for window_name, loader in window_sources:
+            try:
+                raw_df = loader()
+                rescue_df = self._filter_minute_source_with_fallback(
+                    raw_df,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+                if rescue_df is not None and not rescue_df.empty:
+                    candidates.append((window_name, rescue_df))
+                    if (not self._is_minute_tail_stale(rescue_df, end_datetime=end_date)) and self._minute_left_coverage_ok(
+                        rescue_df,
+                        start_datetime=start_date,
+                    ):
+                        return rescue_df.reset_index(drop=True)
+                else:
+                    errors.append(f"{window_name}:sparse_result")
+            except Exception as exc:
+                errors.append(f"{window_name}:{exc}")
 
         picked = self._pick_freshest_source_result(
             candidates,
@@ -944,46 +1353,57 @@ class DataService:
         start_date: str,
         end_date: str,
         period: str,
+        preferred_source: str | None = None,
     ) -> pd.DataFrame:
         errors: list[str] = []
         span_days = self._range_span_days(start_date, end_date, minute_mode=True)
-        symbol_candidates = [symbol, symbol.strip().lower().replace("sh", "").replace("sz", "")]
-        tried: set[str] = set()
-        tasks: list[tuple[str, Callable[[], pd.DataFrame]]] = []
-        for candidate in symbol_candidates:
-            key = candidate.strip()
-            if not key or key in tried:
+        sources = self._build_index_minute_sources(symbol=symbol, period=period)
+        ordered_names = list(sources.keys())
+        if preferred_source in sources:
+            ordered_names = [str(preferred_source)] + [n for n in ordered_names if n != preferred_source]
+
+        # Sequential fallback is more stable than multi-source parallel burst for minute endpoints.
+        candidates_df: list[tuple[str, pd.DataFrame]] = []
+        for name in ordered_names:
+            try:
+                df = sources[name](start_date, end_date)
+            except Exception as exc:
+                errors.append(f"{name}:{exc}")
                 continue
-            tried.add(key)
-            tasks.append(
-                (
-                    f"index_min:{key}",
-                    lambda k=key: self._filter_by_datetime(
-                        ak.index_zh_a_hist_min_em(
-                            symbol=k,
-                            period=period,
-                            start_date=start_date,
-                            end_date=end_date,
-                        ),
-                        start_date,
-                        end_date,
-                    ),
+            if df is None or df.empty:
+                errors.append(f"{name}:sparse_result")
+                continue
+            candidates_df.append((name, df))
+            if (not self._is_minute_tail_stale(df, end_datetime=end_date)) and self._minute_left_coverage_ok(
+                df,
+                start_datetime=start_date,
+            ):
+                return df.reset_index(drop=True)
+
+        # Final rescue: pull a raw minute window once and slice locally.
+        window_sources: list[tuple[str, Callable[[], pd.DataFrame]]] = [
+            ("tx_window", lambda: self._fetch_index_minute_window_tx(symbol=symbol, period=period)),
+            ("sina_window", lambda: self._fetch_index_minute_window(symbol=symbol, period=period)),
+        ]
+        for window_name, loader in window_sources:
+            try:
+                raw_df = loader()
+                rescue_df = self._filter_minute_source_with_fallback(
+                    raw_df,
+                    start_date=start_date,
+                    end_date=end_date,
                 )
-            )
-        quote_symbol = self._normalize_index_symbol(symbol)
-        tasks.append(
-            (
-                "sina_min",
-                lambda: (
-                    lambda df: self._filter_by_datetime(
-                        (df.rename(columns={"day": "datetime"}) if (df is not None and hasattr(df, "columns") and "day" in df.columns) else df),
-                        start_date,
-                        end_date,
-                    )
-                )(ak.stock_zh_a_minute(symbol=quote_symbol, period=period, adjust="")),
-            )
-        )
-        candidates_df = self._run_parallel_dataframe_tasks(tasks, errors, max_workers=3)
+                if rescue_df is not None and not rescue_df.empty:
+                    candidates_df.append((window_name, rescue_df))
+                    if (not self._is_minute_tail_stale(rescue_df, end_datetime=end_date)) and self._minute_left_coverage_ok(
+                        rescue_df,
+                        start_datetime=start_date,
+                    ):
+                        return rescue_df.reset_index(drop=True)
+                else:
+                    errors.append(f"{window_name}:sparse_result")
+            except Exception as exc:
+                errors.append(f"{window_name}:{exc}")
 
         picked = self._pick_freshest_source_result(
             candidates_df,
@@ -1000,6 +1420,257 @@ class DataService:
                 return df.reset_index(drop=True)
         raise RuntimeError(" | ".join(errors))
 
+    def _build_stock_minute_sources(
+        self,
+        *,
+        symbol: str,
+        period: str,
+    ) -> dict[str, Callable[[str, str], pd.DataFrame]]:
+        return {
+            "eastmoney_min": lambda s, e: self._filter_by_datetime(
+                ak.stock_zh_a_hist_min_em(
+                    symbol=symbol,
+                    start_date=s,
+                    end_date=e,
+                    period=period,
+                    adjust="",
+                ),
+                s,
+                e,
+            ),
+            "tx_min": lambda s, e: self._filter_minute_source_with_fallback(
+                self._fetch_stock_minute_window_tx(symbol=symbol, period=period),
+                start_date=s,
+                end_date=e,
+            ),
+            "sina_min": lambda s, e: self._filter_minute_source_with_fallback(
+                self._fetch_stock_minute_window(symbol=symbol, period=period),
+                start_date=s,
+                end_date=e,
+            ),
+        }
+
+    def _build_index_minute_sources(
+        self,
+        *,
+        symbol: str,
+        period: str,
+    ) -> dict[str, Callable[[str, str], pd.DataFrame]]:
+        sources: dict[str, Callable[[str, str], pd.DataFrame]] = {}
+        key = symbol.strip().lower().replace("sh", "").replace("sz", "").strip()
+        if key:
+            sources[f"index_min:{key}"] = (
+                lambda s, e, k=key: self._filter_by_datetime(
+                    ak.index_zh_a_hist_min_em(
+                        symbol=k,
+                        period=period,
+                        start_date=s,
+                        end_date=e,
+                    ),
+                    s,
+                    e,
+                )
+            )
+        sources["tx_min"] = (
+            lambda s, e: self._filter_minute_source_with_fallback(
+                self._fetch_index_minute_window_tx(symbol=symbol, period=period),
+                start_date=s,
+                end_date=e,
+            )
+        )
+        sources["sina_min"] = (
+            lambda s, e: self._filter_minute_source_with_fallback(
+                self._fetch_index_minute_window(symbol=symbol, period=period),
+                start_date=s,
+                end_date=e,
+            )
+        )
+        return sources
+
+    @classmethod
+    def _minute_left_coverage_ok(cls, df: pd.DataFrame, *, start_datetime: str) -> bool:
+        if df is None or df.empty:
+            return False
+        start_ts = pd.to_datetime(start_datetime, errors="coerce")
+        if pd.isna(start_ts):
+            return True
+        _, ts = cls._extract_ts(df)
+        if ts is None:
+            return True
+        ts_clean = ts.dropna()
+        if ts_clean.empty:
+            return True
+        start_day = pd.Timestamp(start_ts).normalize()
+        head_day = pd.Timestamp(ts_clean.min()).normalize()
+        if head_day <= start_day:
+            return True
+        cursor = start_day
+        for _ in range(370):
+            if cursor >= head_day:
+                break
+            if cls._is_trade_day(cursor):
+                return False
+            cursor += pd.Timedelta(days=1)
+        return True
+
+    def _fetch_stock_minute_window(self, *, symbol: str, period: str) -> pd.DataFrame:
+        quote_symbol = self._normalize_stock_symbol(symbol)
+        return self._rename_day_to_datetime(
+            ak.stock_zh_a_minute(symbol=quote_symbol, period=period, adjust="")
+        )
+
+    def _fetch_index_minute_window(self, *, symbol: str, period: str) -> pd.DataFrame:
+        quote_symbol = self._normalize_index_symbol(symbol)
+        return self._rename_day_to_datetime(
+            ak.stock_zh_a_minute(symbol=quote_symbol, period=period, adjust="")
+        )
+
+    def _fetch_stock_minute_window_tx(self, *, symbol: str, period: str) -> pd.DataFrame:
+        quote_symbol = self._normalize_stock_symbol(symbol)
+        return self._fetch_minute_window_tx(symbol=quote_symbol, period=period)
+
+    def _fetch_index_minute_window_tx(self, *, symbol: str, period: str) -> pd.DataFrame:
+        quote_symbol = self._normalize_index_symbol(symbol)
+        return self._fetch_minute_window_tx(symbol=quote_symbol, period=period)
+
+    @staticmethod
+    def _fetch_minute_window_tx(*, symbol: str, period: str) -> pd.DataFrame:
+        mode = DataService._normalize_period(period)
+        if mode not in {"1", "5", "15", "30", "60"}:
+            return pd.DataFrame()
+        raw_symbol = str(symbol or "").strip().lower()
+        if not raw_symbol:
+            return pd.DataFrame()
+        if not raw_symbol.startswith(("sh", "sz", "bj")):
+            if raw_symbol.startswith(("6", "5", "9")):
+                raw_symbol = f"sh{raw_symbol}"
+            else:
+                raw_symbol = f"sz{raw_symbol}"
+        url = "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/kline/mkline"
+        params = {"param": f"{raw_symbol},m{mode},,640"}
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://gu.qq.com/",
+            "Accept": "application/json,text/plain,*/*",
+        }
+        response = requests.get(url, params=params, headers=headers, timeout=15)
+        response.raise_for_status()
+        data_json = response.json()
+        node = data_json.get("data", {}).get(raw_symbol, {})
+        rows = node.get(f"m{mode}", []) if isinstance(node, dict) else []
+        if not isinstance(rows, list) or not rows:
+            return pd.DataFrame()
+        records: list[dict[str, object]] = []
+        for row in rows:
+            if not isinstance(row, list) or len(row) < 6:
+                continue
+            ts_raw = str(row[0]).strip()
+            try:
+                ts = datetime.strptime(ts_raw, "%Y%m%d%H%M")
+            except Exception:
+                continue
+            amount_val = None
+            if len(row) > 7:
+                try:
+                    amount_val = float(row[7])
+                except Exception:
+                    amount_val = None
+            records.append(
+                {
+                    "datetime": ts.strftime("%Y-%m-%d %H:%M:%S"),
+                    "open": pd.to_numeric(row[1], errors="coerce"),
+                    "close": pd.to_numeric(row[2], errors="coerce"),
+                    "high": pd.to_numeric(row[3], errors="coerce"),
+                    "low": pd.to_numeric(row[4], errors="coerce"),
+                    "volume": pd.to_numeric(row[5], errors="coerce"),
+                    "amount": amount_val,
+                }
+            )
+        if not records:
+            return pd.DataFrame()
+        out = pd.DataFrame(records)
+        out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+        out = out.dropna(subset=["datetime"]).drop_duplicates(subset=["datetime"], keep="last").sort_values("datetime")
+        return out.reset_index(drop=True)
+
+    def _select_stock_minute_source(
+        self,
+        *,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        period: str,
+        progress_cb: Callable[[int, str], None] | None = None,
+    ) -> str | None:
+        sources = self._build_stock_minute_sources(symbol=symbol, period=period)
+        return self._select_minute_source(
+            sources=sources,
+            start_date=start_date,
+            end_date=end_date,
+            period=period,
+            progress_cb=progress_cb,
+        )
+
+    def _select_index_minute_source(
+        self,
+        *,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        period: str,
+        progress_cb: Callable[[int, str], None] | None = None,
+    ) -> str | None:
+        sources = self._build_index_minute_sources(symbol=symbol, period=period)
+        return self._select_minute_source(
+            sources=sources,
+            start_date=start_date,
+            end_date=end_date,
+            period=period,
+            progress_cb=progress_cb,
+        )
+
+    def _select_minute_source(
+        self,
+        *,
+        sources: dict[str, Callable[[str, str], pd.DataFrame]],
+        start_date: str,
+        end_date: str,
+        period: str,
+        progress_cb: Callable[[int, str], None] | None = None,
+    ) -> str | None:
+        if not sources:
+            return None
+        probe_start, probe_end = self._minute_probe_range(start_date, end_date, period=period)
+        self._emit_progress(progress_cb, 26, f"网络任务: 分钟源探测 {probe_start}~{probe_end}")
+        best_name: str | None = None
+        best_tail: pd.Timestamp | None = None
+        for name, loader in sources.items():
+            try:
+                df = loader(probe_start, probe_end)
+            except Exception:
+                continue
+            if df is None or df.empty:
+                continue
+            tail = self._series_tail_timestamp(df)
+            if tail is not None and (best_tail is None or tail > best_tail):
+                best_tail = tail
+                best_name = name
+            if not self._is_minute_tail_stale(df, end_datetime=probe_end):
+                self._emit_progress(progress_cb, 27, f"分钟源已选: {name}")
+                return name
+        if best_name is not None:
+            self._emit_progress(progress_cb, 27, f"分钟源兜底: {best_name}")
+            return best_name
+        return None
+
+    @staticmethod
+    def _rename_day_to_datetime(df: pd.DataFrame | None) -> pd.DataFrame | None:
+        if df is None:
+            return None
+        if hasattr(df, "columns") and "day" in df.columns:
+            return df.rename(columns={"day": "datetime"})
+        return df
+
     def _cache_file_paths(self, params: dict[str, str]) -> tuple[Path, Path]:
         payload = json.dumps(params, ensure_ascii=False, sort_keys=True)
         digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
@@ -1014,10 +1685,12 @@ class DataService:
 
     @staticmethod
     def _existing_cache_file(parquet_path: Path, pickle_path: Path) -> Path | None:
-        if parquet_path.exists():
-            return parquet_path
         if pickle_path.exists():
             return pickle_path
+        if parquet_path.exists() and has_parquet_engine():
+            return parquet_path
+        if parquet_path.exists():
+            return parquet_path
         return None
 
     def _adopt_legacy_cache_files(self, subdir: str) -> None:
@@ -1071,11 +1744,20 @@ class DataService:
     @staticmethod
     def _write_cache_dataframe(df: pd.DataFrame, parquet_path: Path, pickle_path: Path) -> Path:
         try:
-            df.to_parquet(parquet_path, index=False)
-            return parquet_path
-        except Exception:
             df.to_pickle(pickle_path)
-            return pickle_path
+        except Exception:
+            pass
+        if has_parquet_engine():
+            try:
+                df.to_parquet(parquet_path, index=False)
+                return parquet_path
+            except Exception:
+                try:
+                    if parquet_path.exists():
+                        parquet_path.unlink()
+                except Exception:
+                    pass
+        return pickle_path
 
     @staticmethod
     def _call_with_retry(
@@ -1302,7 +1984,13 @@ class DataService:
             return start_value, end_value
         max_days = cls._minute_window_days(period)
         min_start = (end_ts.normalize() - pd.Timedelta(days=max_days)).replace(hour=9, minute=30, second=0)
-        clipped_start = max(start_ts, min_start)
+        # For UI auto windows (near full-window span), anchor start to end-based window
+        # so cache keys stay stable during non-trading days/weekends.
+        span_days = int((end_ts - start_ts).days)
+        if span_days >= max(1, max_days - 3):
+            clipped_start = min_start
+        else:
+            clipped_start = max(start_ts, min_start)
         return (
             clipped_start.strftime("%Y-%m-%d %H:%M:%S"),
             end_ts.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1330,24 +2018,41 @@ class DataService:
 
     @classmethod
     def _load_trade_dates(cls) -> set[str]:
-        if cls._TRADE_DATES is not None:
-            return cls._TRADE_DATES
-        dates: set[str] = set()
-        market_dir = cache_root() / "market"
-        parquet_path = market_dir / "trade_dates.parquet"
-        pickle_path = market_dir / "trade_dates.pkl"
-        path = parquet_path if parquet_path.exists() else pickle_path
-        if path.exists():
-            try:
-                df = pd.read_parquet(path) if path.suffix == ".parquet" else pd.read_pickle(path)
-                if df is not None and not df.empty:
+        if cls._TRADE_DATES is None:
+            cls._TRADE_DATES = set()
+            cls._TRADE_DATES_MAX_DAY = None
+            market_dir = cache_root() / "market"
+            parquet_path = market_dir / "trade_dates.parquet"
+            pickle_path = market_dir / "trade_dates.pkl"
+            candidates: list[Path] = []
+            if pickle_path.exists():
+                candidates.append(pickle_path)
+            if parquet_path.exists() and has_parquet_engine():
+                candidates.append(parquet_path)
+            for path in candidates:
+                try:
+                    df = pd.read_parquet(path) if path.suffix == ".parquet" else pd.read_pickle(path)
+                    if df is None or df.empty:
+                        continue
                     col = "trade_date" if "trade_date" in df.columns else df.columns[0]
-                    values = pd.to_datetime(df[col], errors="coerce").dropna().dt.strftime("%Y-%m-%d")
-                    dates = set(values.tolist())
-            except Exception:
-                dates = set()
-        cls._TRADE_DATES = dates
-        return dates
+                    ts = pd.to_datetime(df[col], errors="coerce").dropna().dt.normalize()
+                    if ts.empty:
+                        continue
+                    mn = pd.Timestamp(ts.min()).normalize()
+                    mx = pd.Timestamp(ts.max()).normalize()
+                    now = pd.Timestamp.now().normalize()
+                    # Ignore synthetic weekday calendars that start too early or extend too far into the future.
+                    if mn < pd.Timestamp("1990-12-01"):
+                        continue
+                    if mx > (now + pd.Timedelta(days=370)):
+                        continue
+                    cls._TRADE_DATES = set(ts.dt.strftime("%Y-%m-%d").tolist())
+                    cls._TRADE_DATES_MAX_DAY = pd.Timestamp(ts.max()).normalize()
+                    break
+                except Exception:
+                    continue
+
+        return cls._TRADE_DATES or set()
 
     @classmethod
     def _is_trade_day(cls, day: pd.Timestamp) -> bool:
@@ -1355,6 +2060,10 @@ class DataService:
         key = d.strftime("%Y-%m-%d")
         dates = cls._load_trade_dates()
         if dates:
+            # If the local calendar does not yet cover this date, fallback to weekday.
+            # This prevents outdated calendar files from freezing checkpoints to year-end.
+            if cls._TRADE_DATES_MAX_DAY is not None and d > cls._TRADE_DATES_MAX_DAY:
+                return d.dayofweek < 5
             return key in dates
         return d.dayofweek < 5
 
@@ -1366,6 +2075,35 @@ class DataService:
             if cls._is_trade_day(d):
                 return d
         return d
+
+    @staticmethod
+    def _previous_weekday(day: pd.Timestamp) -> pd.Timestamp:
+        d = pd.Timestamp(day).normalize()
+        while d.dayofweek >= 5:
+            d -= pd.Timedelta(days=1)
+        return d
+
+    @classmethod
+    def _guard_checkpoint_day(cls, checkpoint_day: pd.Timestamp, *, now: pd.Timestamp) -> pd.Timestamp:
+        cp = pd.Timestamp(checkpoint_day).normalize()
+        lag_days = int((now.normalize() - cp).days)
+        if lag_days <= int(cls.CHECKPOINT_MAX_LAG_DAYS):
+            return cp
+        fallback = cls._previous_weekday(now.normalize())
+        if (now.hour, now.minute) < (cls.DAILY_CLOSE_READY_HOUR, cls.DAILY_CLOSE_READY_MINUTE):
+            fallback = cls._previous_weekday(fallback - pd.Timedelta(days=1))
+        return fallback.normalize()
+
+    @classmethod
+    def _guard_checkpoint_minute(cls, checkpoint_ts: pd.Timestamp, *, now: pd.Timestamp) -> pd.Timestamp:
+        cp = pd.Timestamp(checkpoint_ts)
+        lag_days = int((now.normalize() - cp.normalize()).days)
+        if lag_days <= int(cls.CHECKPOINT_MAX_LAG_DAYS):
+            return cp
+        day = cls._previous_weekday(now.normalize())
+        if (now.hour, now.minute) < (9, 30):
+            day = cls._previous_weekday(day - pd.Timedelta(days=1))
+        return day + pd.Timedelta(hours=15)
 
     @classmethod
     def _series_fresh_hash(cls, params: dict[str, str], minute_mode: bool) -> str:
@@ -1409,10 +2147,15 @@ class DataService:
         now = pd.Timestamp.now()
         day = now.normalize()
         if not cls._is_trade_day(day):
-            return cls._previous_trade_day(day).strftime("%Y%m%d")
+            cp = cls._previous_trade_day(day)
+            cp = cls._guard_checkpoint_day(cp, now=now)
+            return cp.strftime("%Y%m%d")
         if (now.hour, now.minute) < (cls.DAILY_CLOSE_READY_HOUR, cls.DAILY_CLOSE_READY_MINUTE):
-            return cls._previous_trade_day(day).strftime("%Y%m%d")
-        return day.strftime("%Y%m%d")
+            cp = cls._previous_trade_day(day)
+            cp = cls._guard_checkpoint_day(cp, now=now)
+            return cp.strftime("%Y%m%d")
+        cp = cls._guard_checkpoint_day(day, now=now)
+        return cp.strftime("%Y%m%d")
 
     @classmethod
     def _minute_checkpoint(cls) -> str:
@@ -1422,20 +2165,26 @@ class DataService:
         if not cls._is_trade_day(day):
             trade_day = cls._previous_trade_day(day)
             checkpoint = trade_day + pd.Timedelta(hours=15)
+            checkpoint = cls._guard_checkpoint_minute(checkpoint, now=now)
             return checkpoint.strftime("%Y%m%d%H%M")
 
         if (now.hour, now.minute) < (9, 30):
             trade_day = cls._previous_trade_day(day)
             checkpoint = trade_day + pd.Timedelta(hours=15)
+            checkpoint = cls._guard_checkpoint_minute(checkpoint, now=now)
             return checkpoint.strftime("%Y%m%d%H%M")
         if (now.hour, now.minute) < (11, 30):
-            return now.floor("min").strftime("%Y%m%d%H%M")
+            checkpoint = cls._guard_checkpoint_minute(now.floor("min"), now=now)
+            return checkpoint.strftime("%Y%m%d%H%M")
         if (now.hour, now.minute) < (13, 0):
             checkpoint = day + pd.Timedelta(hours=11, minutes=30)
+            checkpoint = cls._guard_checkpoint_minute(checkpoint, now=now)
             return checkpoint.strftime("%Y%m%d%H%M")
         if (now.hour, now.minute) < (15, 0):
-            return now.floor("min").strftime("%Y%m%d%H%M")
+            checkpoint = cls._guard_checkpoint_minute(now.floor("min"), now=now)
+            return checkpoint.strftime("%Y%m%d%H%M")
         checkpoint = day + pd.Timedelta(hours=15)
+        checkpoint = cls._guard_checkpoint_minute(checkpoint, now=now)
         return checkpoint.strftime("%Y%m%d%H%M")
 
     @classmethod
@@ -1619,6 +2368,71 @@ class DataService:
         target_ts = pd.Timestamp(end_ts).normalize()
         grace = cls._tail_staleness_grace_days(period) if grace_days is None else max(1, int(grace_days))
         return (target_ts - tail_ts) > pd.Timedelta(days=grace)
+
+    @classmethod
+    def _is_result_fresh_for_request_end(
+        cls,
+        df: pd.DataFrame,
+        *,
+        end_value: str,
+        period: str,
+        minute_mode: bool,
+    ) -> bool:
+        if df is None or df.empty:
+            return False
+        _, ts = cls._extract_ts(df)
+        if ts is None:
+            return True
+        ts_clean = ts.dropna()
+        if ts_clean.empty:
+            return False
+        tail_ts = pd.Timestamp(ts_clean.max())
+        if minute_mode:
+            end_ts = pd.to_datetime(end_value, errors="coerce")
+            if pd.isna(end_ts):
+                return True
+            mode = cls._normalize_period(period)
+            bar_minutes = 1
+            try:
+                if mode in {"1", "5", "15", "30", "60"}:
+                    bar_minutes = max(1, int(mode))
+            except Exception:
+                bar_minutes = 1
+            gap = pd.Timestamp(end_ts) - pd.Timestamp(tail_ts)
+            if gap <= pd.Timedelta(0):
+                return True
+            end_day = pd.Timestamp(end_ts).normalize()
+            tail_day = pd.Timestamp(tail_ts).normalize()
+            now_day = pd.Timestamp.now().normalize()
+            # Same-session gaps: 15m bars may end at 14:45 while UI end is 15:00.
+            if tail_day == end_day:
+                return gap <= pd.Timedelta(minutes=max(8, int(bar_minutes) * 2))
+            # If request end falls on a non-trading day, previous trade day's close is acceptable.
+            if not cls._is_trade_day(end_day):
+                prev = cls._previous_trade_day(end_day).normalize()
+                if tail_day >= prev:
+                    return True
+                return False
+            # Near-now requests: allow at most 1 trade day lag (upstream delays are common).
+            if end_day >= (now_day - pd.Timedelta(days=2)):
+                prev = cls._previous_trade_day(end_day).normalize()
+                if tail_day >= prev:
+                    return True
+            return False
+
+        # keep period in signature for call-site clarity and future policy tuning
+        _ = cls._normalize_period(period)
+        end_ts = pd.to_datetime(end_value, format="%Y%m%d", errors="coerce")
+        if pd.isna(end_ts):
+            return True
+        target_day = pd.Timestamp(end_ts).normalize()
+        tail_day = pd.Timestamp(tail_ts).normalize()
+        if tail_day >= target_day:
+            return True
+        # If request end is a holiday/weekend, previous trade day tail is acceptable.
+        if not cls._is_trade_day(target_day):
+            return tail_day >= cls._previous_trade_day(target_day).normalize()
+        return False
 
     @classmethod
     def _effective_start_for_cached_non_minute(cls, start_value: str, cached_df: pd.DataFrame) -> str:
@@ -1836,27 +2650,158 @@ class DataService:
         end_value: str,
         *,
         chunk_days: int = 20,
+        period: str = "1",
     ) -> list[tuple[str, str]]:
         try:
             start_ts = pd.to_datetime(start_value, errors="coerce")
             end_ts = pd.to_datetime(end_value, errors="coerce")
             if pd.isna(start_ts) or pd.isna(end_ts) or start_ts > end_ts:
                 return [(start_value, end_value)]
+            bar_minutes = 1
+            try:
+                mode = DataService._normalize_period(period)
+                if mode in {"1", "5", "15", "30", "60"}:
+                    bar_minutes = max(1, int(mode))
+            except Exception:
+                bar_minutes = 1
             step = pd.Timedelta(days=max(1, int(chunk_days)))
             cursor = start_ts
             ranges: list[tuple[str, str]] = []
             while cursor <= end_ts:
-                chunk_end = min(cursor + step, end_ts)
+                chunk_end = cursor + step
+                # Avoid generating a tiny trailing fragment such as 09:31~15:00,
+                # which adds one more fragile network round-trip with low value.
+                if (end_ts - chunk_end) <= pd.Timedelta(hours=8):
+                    chunk_end = end_ts
+                else:
+                    chunk_end = min(chunk_end, end_ts)
                 ranges.append(
                     (
                         cursor.strftime("%Y-%m-%d %H:%M:%S"),
                         chunk_end.strftime("%Y-%m-%d %H:%M:%S"),
                     )
                 )
-                cursor = chunk_end + pd.Timedelta(minutes=1)
+                cursor = chunk_end + pd.Timedelta(minutes=bar_minutes)
             return ranges if ranges else [(start_value, end_value)]
         except Exception:
             return [(start_value, end_value)]
+
+    @classmethod
+    def _filter_minute_source_with_fallback(
+        cls,
+        df: pd.DataFrame | None,
+        *,
+        start_date: str,
+        end_date: str,
+    ) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        filtered = cls._filter_by_datetime(df, start_date, end_date)
+        if filtered is not None and not filtered.empty:
+            return filtered
+        tail_ts = cls._series_tail_timestamp(df)
+        end_ts = pd.to_datetime(end_date, errors="coerce")
+        if tail_ts is None or pd.isna(end_ts):
+            return filtered if filtered is not None else pd.DataFrame()
+        # When fixed-window minute sources return only recent data, keep it as fallback
+        # only if tail is close to request end (avoid polluting older chunks).
+        if pd.Timestamp(tail_ts) > (pd.Timestamp(end_ts) + pd.Timedelta(days=1)):
+            return filtered if filtered is not None else pd.DataFrame()
+        if TimeSeriesCache._is_tolerable_right_gap(
+            pd.Timestamp(tail_ts),
+            pd.Timestamp(end_ts),
+            True,
+        ):
+            return df
+        return filtered if filtered is not None else pd.DataFrame()
+
+    @classmethod
+    def _build_tail_update_ranges(
+        cls,
+        *,
+        cached_df: pd.DataFrame,
+        end_value: str,
+        minute_mode: bool,
+    ) -> list[tuple[str, str]]:
+        _, ts = cls._extract_ts(cached_df)
+        if ts is None:
+            return []
+        ts_clean = ts.dropna()
+        if ts_clean.empty:
+            return []
+        tail_ts = pd.Timestamp(ts_clean.max())
+        end_ts = cls._range_text_to_ts(end_value, minute_mode)
+        if end_ts is None:
+            return []
+        delta = pd.Timedelta(minutes=1) if minute_mode else pd.Timedelta(days=1)
+        start_ts = tail_ts + delta
+        if start_ts > end_ts:
+            return []
+        return [
+            (
+                cls._ts_to_range_text(pd.Timestamp(start_ts), minute_mode),
+                cls._ts_to_range_text(pd.Timestamp(end_ts), minute_mode),
+            )
+        ]
+
+    @staticmethod
+    def _minute_chunk_days(
+        *,
+        period: str,
+        span_days: int | None,
+        has_cache: bool,
+    ) -> int:
+        mode = DataService._normalize_period(period)
+        # Prefer smaller chunks on cold-start for 5/15m to reduce single-request fragility.
+        if not has_cache:
+            base = {
+                "1": 8,
+                "5": 12,
+                "15": 20,
+                "30": 30,
+                "60": 45,
+            }.get(mode, 18)
+        else:
+            base = {
+                "1": 11,
+                "5": 46,
+                "15": 121,
+                "30": 241,
+                "60": 366,
+            }.get(mode, 30)
+        if has_cache:
+            # Incremental updates prefer single larger chunk to reduce request count.
+            base = max(base, 60)
+        if span_days is not None and span_days > 220:
+            base = max(base, 180)
+        return int(base)
+
+    @staticmethod
+    def _minute_probe_range(
+        start_date: str,
+        end_date: str,
+        *,
+        period: str,
+    ) -> tuple[str, str]:
+        start_ts = pd.to_datetime(start_date, errors="coerce")
+        end_ts = pd.to_datetime(end_date, errors="coerce")
+        if pd.isna(start_ts) or pd.isna(end_ts) or start_ts > end_ts:
+            return start_date, end_date
+        probe_days = {
+            "1": 2,
+            "5": 4,
+            "15": 7,
+            "30": 10,
+            "60": 14,
+        }.get(DataService._normalize_period(period), 5)
+        probe_start = max(
+            pd.Timestamp(start_ts),
+            (pd.Timestamp(end_ts).normalize() - pd.Timedelta(days=int(probe_days))).replace(hour=9, minute=30, second=0),
+        )
+        return (
+            probe_start.strftime("%Y-%m-%d %H:%M:%S"),
+            pd.Timestamp(end_ts).strftime("%Y-%m-%d %H:%M:%S"),
+        )
 
     @staticmethod
     def _filter_by_date(df: pd.DataFrame, start_date: str, end_date: str) -> pd.DataFrame:
@@ -1892,5 +2837,4 @@ class DataService:
             return df
         date_series = DataService._parse_datetime_series(df[date_col])
         mask = date_series.between(start, end)
-        filtered = df.loc[mask].reset_index(drop=True)
-        return filtered if not filtered.empty else df
+        return df.loc[mask].reset_index(drop=True)

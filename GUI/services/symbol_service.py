@@ -7,6 +7,7 @@ import akshare as ak
 import pandas as pd
 
 from core.cache_paths import legacy_cache_roots
+from core.parquet_compat import has_parquet_engine
 
 
 @dataclass(frozen=True)
@@ -25,32 +26,60 @@ class SymbolService:
         self._adopt_legacy_cache_files("symbols")
 
     def load_cache(self) -> SymbolData | None:
-        path = self._parquet_path if self._parquet_path.exists() else self._pickle_path
-        if not path.exists():
+        if self._pickle_path.exists():
+            candidates: list[Path] = [self._pickle_path]
+        else:
+            candidates = []
+        if self._parquet_path.exists() and has_parquet_engine():
+            candidates.append(self._parquet_path)
+        if not candidates:
             return None
-        try:
-            df = pd.read_parquet(path) if path.suffix == ".parquet" else pd.read_pickle(path)
-            return self._to_symbol_data(df)
-        except Exception:
-            return None
+        for path in candidates:
+            try:
+                df = pd.read_parquet(path) if path.suffix == ".parquet" else pd.read_pickle(path)
+                symbol_data = self._to_symbol_data(df)
+                if symbol_data is not None and symbol_data.records:
+                    return symbol_data
+            except Exception:
+                continue
+        return None
 
     def save_cache(self, symbol_data: SymbolData) -> None:
         if not symbol_data.records:
             return
         df = pd.DataFrame(symbol_data.records, columns=["code", "name"])
         try:
-            df.to_parquet(self._parquet_path, index=False)
-            return
+            df.to_pickle(self._pickle_path)
         except Exception:
             pass
-        df.to_pickle(self._pickle_path)
+        if has_parquet_engine():
+            try:
+                df.to_parquet(self._parquet_path, index=False)
+            except Exception:
+                try:
+                    if self._parquet_path.exists():
+                        self._parquet_path.unlink()
+                except Exception:
+                    pass
 
     def fetch_remote(self) -> SymbolData:
-        df = ak.stock_info_a_code_name()
-        symbol_data = self._to_symbol_data(df)
-        if symbol_data is None:
-            raise RuntimeError("股票列表为空")
-        return symbol_data
+        errors: list[str] = []
+        loaders = (
+            ("stock_info_a_code_name", lambda: ak.stock_info_a_code_name()),
+            ("stock_zh_a_spot_em", lambda: self._extract_code_name_df(ak.stock_zh_a_spot_em())),
+            ("stock_zh_a_spot", lambda: self._extract_code_name_df(ak.stock_zh_a_spot())),
+        )
+        for source_name, loader in loaders:
+            try:
+                df = loader()
+                symbol_data = self._to_symbol_data(df)
+                if symbol_data is not None and symbol_data.records:
+                    return symbol_data
+                errors.append(f"{source_name}:empty")
+            except Exception as exc:
+                errors.append(f"{source_name}:{exc}")
+        detail = " | ".join(errors) if errors else "no_source"
+        raise RuntimeError(f"股票列表为空: {detail}")
 
     @staticmethod
     def build_suggestions(query: str, records: list[tuple[str, str]], limit: int = 20) -> list[str]:
@@ -109,6 +138,32 @@ class SymbolService:
         if not records:
             return None
         return SymbolData(records=records, candidates=candidates, name_to_code=name_to_code)
+
+    @staticmethod
+    def _extract_code_name_df(df: pd.DataFrame | None) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["code", "name"])
+        code_col = None
+        name_col = None
+        for candidate in ("代码", "证券代码", "symbol", "code"):
+            if candidate in df.columns:
+                code_col = candidate
+                break
+        for candidate in ("名称", "证券名称", "name"):
+            if candidate in df.columns:
+                name_col = candidate
+                break
+        if code_col is None or name_col is None:
+            return pd.DataFrame(columns=["code", "name"])
+        out = df[[code_col, name_col]].copy()
+        out.columns = ["code", "name"]
+        out["code"] = out["code"].astype(str).str.strip().str.replace(".0", "", regex=False)
+        out["code"] = out["code"].where(out["code"].str.isdigit(), out["code"])
+        out["code"] = out["code"].apply(lambda x: x.zfill(6) if isinstance(x, str) and x.isdigit() else x)
+        out["name"] = out["name"].astype(str).str.strip()
+        out = out[(out["code"] != "") & (out["name"] != "")]
+        out = out.drop_duplicates(subset=["code"], keep="first").reset_index(drop=True)
+        return out
 
     def _adopt_legacy_cache_files(self, subdir: str) -> None:
         for legacy_root in legacy_cache_roots():

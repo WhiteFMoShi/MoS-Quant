@@ -10,7 +10,7 @@ from pathlib import Path
 
 import akshare as ak
 import pandas as pd
-from PySide6.QtCore import QDate, QLocale, QPoint, Qt, QThread, QSignalBlocker, Signal, QStringListModel
+from PySide6.QtCore import QDate, QLocale, QPoint, Qt, QThread, QSignalBlocker, QTimer, Signal, QStringListModel
 from PySide6.QtGui import QBrush, QColor, QFont, QIcon, QKeySequence, QShortcut, QTextCharFormat
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -42,8 +42,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.data_service import FetchRequest, FetchResponse
+from core.data_service import DataService, FetchRequest, FetchResponse
 from core.cache_paths import cache_root
+from core.parquet_compat import has_parquet_engine
 from GUI.config.column_labels import to_chinese_headers
 from GUI.config.datasets import DATASET_OPTIONS, DatasetOption
 from GUI.services.symbol_service import SymbolData, SymbolService
@@ -60,6 +61,7 @@ class MainWindow(QMainWindow):
     sector_data_loaded = Signal(str, object, object)
     market_extension_loaded = Signal(str, object)
     watch_spot_loaded = Signal(object, object)
+    trade_dates_loaded = Signal(object, object)
 
     DATASETS = DATASET_OPTIONS
     NAV_WIDTH = 68
@@ -94,7 +96,12 @@ class MainWindow(QMainWindow):
         self._active_fetch_scene = "data"
         self._market_symbol = "000001"
         self._market_initialized = False
+        self._market_fetch_pending = False
         self._trade_dates: set[str] = set()
+        self._trade_dates_loading = False
+        self._trade_dates_prepared = False
+        self._trade_dates_retry_scheduled = False
+        self._trade_dates_retry_count = 0
         self._board_change_cache_date = ""
         self._board_change_cache: dict[str, float] = {}
         self._stock_sector_cache: dict[str, str] = {}
@@ -112,6 +119,8 @@ class MainWindow(QMainWindow):
         self._watch_spot_cache: dict[str, dict[str, object]] = {}
         self._watch_spot_cache_ts = 0.0
         self._watch_spot_loading = False
+        self._watch_spot_pending = False
+        self._ui_ready = False
         watch_cache_dir = self._cache_root / "watch"
         watch_cache_dir.mkdir(parents=True, exist_ok=True)
         self._watch_spot_snapshot_file = watch_cache_dir / "spot_snapshot.json"
@@ -129,9 +138,14 @@ class MainWindow(QMainWindow):
         self.sector_data_loaded.connect(self._on_sector_data_loaded)
         self.market_extension_loaded.connect(self._on_market_extension_loaded)
         self.watch_spot_loaded.connect(self._on_watch_spot_loaded)
+        self.trade_dates_loaded.connect(self._on_trade_dates_loaded)
         self._build_ui()
         self._apply_style()
         self._bind_shortcuts()
+        # Prepare trade calendar early so minute checkpoints and date widgets behave consistently,
+        # even if user never enters the data page.
+        if (not self._trade_dates_prepared) and (not self._trade_dates_loading):
+            self._prepare_trade_dates()
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -749,8 +763,15 @@ class MainWindow(QMainWindow):
         self._switch_left_page(self.PAGE_WATCH)
         self._refresh_market_identity()
         self._tune_date_calendars()
-        self._prepare_trade_dates()
         self._position_floating_pod()
+        self._ui_ready = True
+        QTimer.singleShot(1200, self._run_startup_deferred_tasks)
+
+    def _run_startup_deferred_tasks(self) -> None:
+        if self._thread is not None:
+            return
+        if self.left_pages.currentIndex() == self.PAGE_WATCH and self._watch_spot_pending:
+            self._ensure_watch_spot_loaded()
 
     def _bind_shortcuts(self) -> None:
         self._enter_shortcut = QShortcut(QKeySequence(Qt.Key_Return), self)
@@ -907,6 +928,11 @@ class MainWindow(QMainWindow):
         self._sync_market_chart_mode()
         self._refresh_market_identity()
         if self.left_pages.currentIndex() == self.PAGE_MARKET and self._market_initialized:
+            if self._thread is not None:
+                if not self._market_fetch_pending:
+                    self._append_log("行情参数已变更，当前任务结束后自动刷新")
+                self._market_fetch_pending = True
+                return
             self._trigger_market_fetch()
 
     def _on_indicator_controls_changed(self) -> None:
@@ -992,40 +1018,237 @@ class MainWindow(QMainWindow):
             )
 
     def _prepare_trade_dates(self) -> None:
+        self._trade_dates_prepared = True
         if self._load_trade_dates_from_cache():
             self._refresh_all_calendar_marks()
+            # Cache-first for responsiveness, then refresh calendar source in background.
+            self._schedule_trade_dates_retry(delay_seconds=2)
+            return
+        if self._trade_dates_loading:
+            return
+        self._trade_dates_loading = True
+        threading.Thread(target=self._load_trade_dates_async, daemon=True).start()
+
+    def _load_trade_dates_async(self) -> None:
+        errors: list[str] = []
+        dates = sorted(self._load_trade_dates_remote(errors))
+        self.trade_dates_loaded.emit(dates, errors)
+
+    def _on_trade_dates_loaded(self, dates_obj: object, errors_obj: object) -> None:
+        self._trade_dates_loading = False
+        errors: list[str] = []
+        if isinstance(errors_obj, list):
+            errors = [str(item) for item in errors_obj if str(item).strip()]
+
+        dates: set[str] = set()
+        if isinstance(dates_obj, (list, tuple, set)):
+            dates = {str(item) for item in dates_obj if str(item).strip()}
+        if not dates:
+            fallback_dates = self._build_weekday_trade_dates()
+            if fallback_dates:
+                self._trade_dates = fallback_dates
+                self._refresh_all_calendar_marks()
+            self._trade_dates_prepared = True
+            self._trade_dates_retry_count += 1
+            self._schedule_trade_dates_retry()
+            if errors:
+                self._append_log("交易日历主源波动，已回退为工作日规则（不影响数据抓取），后台将自动重试")
             return
 
+        self._trade_dates_retry_count = 0
+        self._trade_dates_retry_scheduled = False
+        self._trade_dates_prepared = True
+        self._trade_dates = dates
+        self._persist_trade_dates_cache(self._trade_dates)
+        if errors:
+            self._append_log("交易日历主源波动，已自动切换备用源")
+        self._refresh_all_calendar_marks()
+
+    def _schedule_trade_dates_retry(self, delay_seconds: int | None = None) -> None:
+        if self._trade_dates_retry_scheduled or self._trade_dates_loading:
+            return
+        if delay_seconds is None:
+            # 60s, 120s, 240s, 480s, then cap at 900s
+            delay_seconds = min(900, int(60 * (2 ** min(self._trade_dates_retry_count, 3))))
+        self._trade_dates_retry_scheduled = True
+        QTimer.singleShot(max(10, int(delay_seconds)) * 1000, self._retry_trade_dates_fetch)
+
+    def _retry_trade_dates_fetch(self) -> None:
+        self._trade_dates_retry_scheduled = False
+        if self._trade_dates_loading:
+            return
+        self._trade_dates_loading = True
+        threading.Thread(target=self._load_trade_dates_async, daemon=True).start()
+
+    def _load_trade_dates_remote(self, errors: list[str]) -> set[str]:
+        def call_with_timeout(loader: object, timeout_seconds: float = 12.0) -> pd.DataFrame:
+            payload: dict[str, object] = {}
+            error: dict[str, Exception] = {}
+
+            def runner() -> None:
+                try:
+                    payload["df"] = loader()
+                except Exception as exc:
+                    error["exc"] = exc
+
+            t = threading.Thread(target=runner, daemon=True)
+            t.start()
+            t.join(timeout=max(0.5, float(timeout_seconds)))
+            if t.is_alive():
+                raise TimeoutError("timeout")
+            if "exc" in error:
+                raise error["exc"]
+            df = payload.get("df")
+            if not isinstance(df, pd.DataFrame):
+                return pd.DataFrame()
+            return df
+
+        loaders = (
+            ("sina_trade_calendar", lambda: ak.tool_trade_date_hist_sina()),
+            ("tencent_index_daily_calendar", lambda: ak.stock_zh_index_daily_tx(symbol="sh000001")),
+            ("sina_index_daily_calendar", lambda: ak.stock_zh_index_daily(symbol="sh000001")),
+            (
+                "eastmoney_index_daily_calendar",
+                lambda: ak.index_zh_a_hist(
+                    symbol="000001",
+                    period="daily",
+                    start_date="19900101",
+                    end_date=QDate.currentDate().toString("yyyyMMdd"),
+                ),
+            ),
+        )
+        for source_name, loader in loaders:
+            try:
+                df = call_with_timeout(loader, timeout_seconds=12.0)
+                dates = self._extract_trade_dates(df)
+                if dates:
+                    return dates
+                errors.append(f"{source_name}:empty")
+            except Exception as exc:
+                errors.append(f"{source_name}:{exc}")
+        return set()
+
+    @staticmethod
+    def _parse_trade_date_values(values: pd.Series) -> pd.Series:
+        index = values.index
+        parsers = (
+            lambda: pd.to_datetime(values, errors="coerce"),
+            lambda: pd.to_datetime(values, errors="coerce", format="ISO8601", utc=True),
+            lambda: pd.to_datetime(values, errors="coerce", format="mixed", utc=True),
+        )
+        for parser in parsers:
+            try:
+                parsed = parser()
+                ts = parsed if isinstance(parsed, pd.Series) else pd.Series(parsed, index=index)
+                try:
+                    if hasattr(ts, "dt") and ts.dt.tz is not None:
+                        ts = ts.dt.tz_convert(None)
+                except Exception:
+                    try:
+                        ts = ts.dt.tz_localize(None)
+                    except Exception:
+                        pass
+                if ts.notna().sum() > 0:
+                    return ts
+            except Exception:
+                continue
+        return pd.Series(pd.NaT, index=index)
+
+    @classmethod
+    def _extract_trade_dates(cls, df: pd.DataFrame | None) -> set[str]:
+        if df is None or df.empty:
+            return set()
+        col: str | None = None
+        for candidate in ("trade_date", "date", "日期", "datetime", "时间", "day"):
+            if candidate in df.columns:
+                col = candidate
+                break
+        if col is None:
+            col = df.columns[0]
+        ts = cls._parse_trade_date_values(df[col]).dropna()
+        if ts.empty:
+            return set()
+        return set(ts.dt.strftime("%Y-%m-%d").tolist())
+
+    def _persist_trade_dates_cache(self, dates: set[str]) -> None:
+        if not dates:
+            return
+        cache_df = pd.DataFrame({"trade_date": pd.Series(sorted(dates), dtype="object")})
+        # Always write pickle first so environments without parquet engines can still load the cache.
         try:
-            df = ak.tool_trade_date_hist_sina()
-            if df is None or df.empty:
-                return
-            col = "trade_date" if "trade_date" in df.columns else df.columns[0]
-            trade_dates = pd.to_datetime(df[col], errors="coerce").dropna().dt.strftime("%Y-%m-%d")
-            self._trade_dates = set(trade_dates.tolist())
-            cache_df = pd.DataFrame({"trade_date": sorted(self._trade_dates)})
+            cache_df.to_pickle(self._trade_dates_pickle)
+        except Exception:
+            pass
+        if has_parquet_engine():
             try:
                 cache_df.to_parquet(self._trade_dates_parquet, index=False)
             except Exception:
-                cache_df.to_pickle(self._trade_dates_pickle)
-            self._refresh_all_calendar_marks()
-        except Exception as exc:
-            self._append_log(f"交易日历加载失败: {exc}")
+                # Prevent unreadable stale parquet from shadowing valid pickle cache.
+                try:
+                    if self._trade_dates_parquet.exists():
+                        self._trade_dates_parquet.unlink()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _build_weekday_trade_dates() -> set[str]:
+        start = QDate(1990, 1, 1)
+        end = QDate.currentDate().addYears(2)
+        out: set[str] = set()
+        cursor = QDate(start)
+        while cursor <= end:
+            if cursor.dayOfWeek() < 6:
+                out.add(cursor.toString("yyyy-MM-dd"))
+            cursor = cursor.addDays(1)
+        return out
 
     def _load_trade_dates_from_cache(self) -> bool:
-        path = self._trade_dates_parquet if self._trade_dates_parquet.exists() else self._trade_dates_pickle
-        if not path.exists():
+        if self._trade_dates_pickle.exists():
+            candidates = [self._trade_dates_pickle]
+        else:
+            candidates = []
+        if self._trade_dates_parquet.exists() and has_parquet_engine():
+            candidates.append(self._trade_dates_parquet)
+        if not candidates:
             return False
+
+        for path in candidates:
+            try:
+                df = pd.read_parquet(path) if path.suffix == ".parquet" else pd.read_pickle(path)
+                if df is None or df.empty:
+                    continue
+                dates = self._extract_trade_dates(df)
+                if not dates:
+                    continue
+                if self._is_synthetic_trade_dates(dates):
+                    continue
+                self._trade_dates = dates
+                if self._trade_dates:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    @staticmethod
+    def _is_synthetic_trade_dates(dates: set[str]) -> bool:
+        if not dates:
+            return True
         try:
-            df = pd.read_parquet(path) if path.suffix == ".parquet" else pd.read_pickle(path)
-            if df is None or df.empty:
-                return False
-            col = "trade_date" if "trade_date" in df.columns else df.columns[0]
-            values = pd.to_datetime(df[col], errors="coerce").dropna().dt.strftime("%Y-%m-%d")
-            self._trade_dates = set(values.tolist())
-            return bool(self._trade_dates)
-        except Exception:
+            ts = pd.to_datetime(sorted(dates), errors="coerce")
+            ts = ts[pd.notna(ts)]
+            if len(ts) == 0:
+                return True
+            mn = pd.Timestamp(ts.min()).normalize()
+            mx = pd.Timestamp(ts.max()).normalize()
+            now = pd.Timestamp.now().normalize()
+            # Synthetic weekday calendars typically start at 1990-01-01 and extend far into the future.
+            if mn < pd.Timestamp("1990-12-01"):
+                return True
+            if mx > (now + pd.Timedelta(days=370)):
+                return True
             return False
+        except Exception:
+            return True
 
     def _refresh_all_calendar_marks(self) -> None:
         for date_edit in (self.start_date_edit, self.end_date_edit, self.single_date_edit):
@@ -1113,6 +1336,8 @@ class MainWindow(QMainWindow):
             self._reload_help_docs()
         else:
             self.right_pages.setCurrentIndex(self.RIGHT_PAGE_ANALYSIS)
+            if (not self._trade_dates_prepared) and (not self._trade_dates_loading):
+                self._prepare_trade_dates()
         if not self.quick_symbol_input.isHidden():
             self._hide_quick_symbol_input()
         if index == self.PAGE_MARKET and not self._market_initialized:
@@ -1159,13 +1384,27 @@ class MainWindow(QMainWindow):
             for col in (3, 4, 5, 6, 7):
                 self.watch_list.setItem(row - 1, col, self._make_watch_item("--", align=Qt.AlignRight | Qt.AlignVCenter))
         self._autosize_watch_columns()
-        self._ensure_watch_spot_loaded()
+        if self.left_pages.currentIndex() == self.PAGE_WATCH:
+            self._ensure_watch_spot_loaded()
+        else:
+            self._watch_spot_pending = bool(self._watchlist)
 
     def _ensure_watch_spot_loaded(self, *, force: bool = False) -> None:
         if not self._watchlist:
+            self._watch_spot_pending = False
+            return
+        if (not force) and (not self._ui_ready):
+            self._watch_spot_pending = True
             return
         if self._watch_spot_loading:
             return
+        if self._thread is not None:
+            self._watch_spot_pending = True
+            return
+        if (not force) and self.left_pages.currentIndex() != self.PAGE_WATCH:
+            self._watch_spot_pending = True
+            return
+        self._watch_spot_pending = False
         cache_covers_all = bool(self._watch_spot_cache) and all(
             code in self._watch_spot_cache for code in self._watchlist
         )
@@ -1936,8 +2175,14 @@ class MainWindow(QMainWindow):
         self._start_worker(request)
 
     def _on_market_refresh_clicked(self) -> None:
+        if self._thread is not None:
+            self._market_fetch_pending = True
+            return
         request = self._build_market_request()
+        if self._try_render_market_from_memory_cache(request):
+            return
         # Always route refresh through the data service so cache freshness rules apply.
+        self._market_fetch_pending = False
         self._active_fetch_scene = "market"
         self._set_fetch_buttons_enabled(False)
         self._set_fetch_progress(active=True)
@@ -1945,6 +2190,10 @@ class MainWindow(QMainWindow):
         dataset_name = "指数" if request.dataset == "index_daily" else "A股"
         self._append_log(
             f"开始抓取: 行情 {dataset_name}{self._period_label_text(request.period)} {self._market_symbol} ({mode})"
+        )
+        self._append_log(
+            f"请求参数: dataset={request.dataset}, symbol={request.symbol}, period={request.period}, "
+            f"start={request.start_date}, end={request.end_date}"
         )
         self._start_worker(request)
 
@@ -1963,6 +2212,9 @@ class MainWindow(QMainWindow):
         key = self._market_request_cache_key(request)
         cached = self._market_mem_cache_response
         if cached is None or self._market_mem_cache_key != key:
+            return False
+        if not self._is_market_response_fresh(cached, request):
+            self._append_log("内存缓存末端落后，自动执行网络增量更新")
             return False
         self._active_fetch_scene = "market"
         self._render_market_response(cached)
@@ -2049,6 +2301,9 @@ class MainWindow(QMainWindow):
     def _on_fetch_error(self, message: str) -> None:
         friendly = self._humanize_fetch_error(message)
         self._append_log(f"抓取失败:\n{friendly}")
+        if self.refresh_cache_check.isChecked():
+            self.refresh_cache_check.setChecked(False)
+            self._append_log("已自动取消强制刷新，后续将优先使用缓存/增量更新。")
         title = "行情获取失败" if self._active_fetch_scene == "market" else "分析获取失败"
         QMessageBox.critical(self, title, friendly)
 
@@ -2058,6 +2313,16 @@ class MainWindow(QMainWindow):
         self._thread = None
         self._worker = None
         self._last_fetch_request = None
+        if (
+            self._market_fetch_pending
+            and self.left_pages.currentIndex() == self.PAGE_MARKET
+            and self._market_initialized
+        ):
+            self._market_fetch_pending = False
+            self._on_market_refresh_clicked()
+            return
+        if self._watch_spot_pending and self.left_pages.currentIndex() == self.PAGE_WATCH:
+            self._ensure_watch_spot_loaded()
 
     def _on_fetch_progress(self, percent: int, message: str) -> None:
         if self.progress_block.isHidden():
@@ -2095,6 +2360,8 @@ class MainWindow(QMainWindow):
         text = text.replace("eastmoney:", "东财源: ")
         text = text.replace("sina:", "新浪源: ")
         text = text.replace("tencent:", "腾讯源: ")
+        text = text.replace("tx_min:", "腾讯分钟源: ")
+        text = text.replace("tx_window:", "腾讯窗口源: ")
         text = text.replace("新浪源: date", "新浪源: 时间字段解析异常（上游格式波动）")
         text = text.replace("index_min:", "指数分钟源: ")
         text = text.replace("RemoteDisconnected", "远端连接中断")
@@ -2143,19 +2410,58 @@ class MainWindow(QMainWindow):
         return text
 
     def _render_market_response(self, response: FetchResponse) -> None:
-        date_col = self._pick_column(response.dataframe, ("日期", "date", "trade_date", "datetime"))
+        df = response.dataframe
+        date_col = self._pick_column(df, ("日期", "date", "trade_date", "datetime"))
+        if date_col is not None and df is not None and not df.empty:
+            ts = self._parse_trade_date_values(df[date_col])
+            ts_clean = ts.dropna()
+            if not ts_clean.empty:
+                safe = df.copy()
+                safe["_market_dt_"] = ts
+                safe = safe.dropna(subset=["_market_dt_"]).sort_values("_market_dt_")
+                safe = safe.drop(columns=["_market_dt_"]).reset_index(drop=True)
+                if not safe.empty:
+                    df = safe
+                    date_col = self._pick_column(df, ("日期", "date", "trade_date", "datetime"))
         self._sync_market_chart_mode()
         self._refresh_market_identity()
-        if date_col is not None and not response.dataframe.empty:
-            start_date = self._fmt_meta_date(response.dataframe.iloc[0][date_col])
-            end_date = self._fmt_meta_date(response.dataframe.iloc[-1][date_col])
+        if date_col is not None and not df.empty:
+            ts = self._parse_trade_date_values(df[date_col]).dropna()
+            if not ts.empty:
+                start_date = pd.Timestamp(ts.min()).strftime("%Y.%m.%d")
+                end_date = pd.Timestamp(ts.max()).strftime("%Y.%m.%d")
+            else:
+                start_date = self._fmt_meta_date(df.iloc[0][date_col])
+                end_date = self._fmt_meta_date(df.iloc[-1][date_col])
             self.market_meta_title.setText(self._fmt_meta_range(start_date, end_date))
         else:
             self.market_meta_title.setText("--")
-        self.market_chart.set_dataframe(response.dataframe)
-        self._update_market_summary(response.dataframe)
-        self._update_market_extensions(response.dataframe)
+        self.market_chart.set_dataframe(df)
+        self._update_market_summary(df)
+        self._update_market_extensions(df)
         self._refresh_market_sector_badge()
+
+    def _is_market_response_fresh(self, response: FetchResponse, request: FetchRequest) -> bool:
+        period = DataService._normalize_period(str(request.period or "daily"))
+        minute_mode = period in {"1", "5", "15", "30", "60"}
+        end_value = str(request.end_date or "").strip()
+        if minute_mode:
+            if len(end_value) <= 10:
+                end_value = f"{end_value} 15:00:00"
+        else:
+            parsed = pd.to_datetime(end_value, errors="coerce")
+            if pd.isna(parsed):
+                return False
+            end_value = pd.Timestamp(parsed).strftime("%Y%m%d")
+        try:
+            return DataService._is_result_fresh_for_request_end(
+                response.dataframe,
+                end_value=end_value,
+                period=period,
+                minute_mode=minute_mode,
+            )
+        except Exception:
+            return False
 
     def _update_market_summary(self, df: pd.DataFrame) -> None:
         if df is None or df.empty:

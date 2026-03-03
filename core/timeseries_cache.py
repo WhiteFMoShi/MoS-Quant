@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from core.parquet_compat import has_parquet_engine
+
 
 class TimeSeriesCache:
     """Incremental cache helper for time-series datasets."""
@@ -29,10 +31,10 @@ class TimeSeriesCache:
     def load(self, params: dict[str, str], minute_mode: bool) -> tuple[pd.DataFrame, Path | None]:
         parquet_path, pickle_path = self.cache_paths(params)
         candidates: list[Path] = []
-        if parquet_path.exists():
-            candidates.append(parquet_path)
         if pickle_path.exists():
             candidates.append(pickle_path)
+        if parquet_path.exists() and has_parquet_engine():
+            candidates.append(parquet_path)
         if not candidates:
             return pd.DataFrame(), None
         for candidate in candidates:
@@ -64,17 +66,20 @@ class TimeSeriesCache:
     @staticmethod
     def write_dataframe(df: pd.DataFrame, parquet_path: Path, pickle_path: Path) -> Path:
         try:
-            df.to_parquet(parquet_path, index=False)
-            return parquet_path
-        except Exception:
-            # Prevent unreadable stale parquet from shadowing valid pickle cache.
-            try:
-                if parquet_path.exists():
-                    parquet_path.unlink()
-            except Exception:
-                pass
             df.to_pickle(pickle_path)
-            return pickle_path
+        except Exception:
+            pass
+        if has_parquet_engine():
+            try:
+                df.to_parquet(parquet_path, index=False)
+                return parquet_path
+            except Exception:
+                try:
+                    if parquet_path.exists():
+                        parquet_path.unlink()
+                except Exception:
+                    pass
+        return pickle_path
 
     @classmethod
     def merge(
@@ -140,8 +145,7 @@ class TimeSeriesCache:
         if start_ts is None or end_ts is None:
             return df.reset_index(drop=True)
         mask = ts.between(start_ts, end_ts)
-        out = df.loc[mask].reset_index(drop=True)
-        return out if not out.empty else df.reset_index(drop=True)
+        return df.loc[mask].reset_index(drop=True)
 
     @classmethod
     def covers_range(
@@ -164,9 +168,6 @@ class TimeSeriesCache:
         ts_max = ts.max()
         if pd.isna(ts_min) or pd.isna(ts_max):
             return False
-        if minute_mode:
-            # Minute APIs often provide only a recent window. Treat cache as valid if right edge is covered.
-            return bool(ts_max >= end_ts) or cls._is_tolerable_right_gap(ts_max, end_ts, minute_mode)
         start_ok = bool(ts_min <= start_ts) or cls._is_tolerable_left_gap(start_ts, ts_min, minute_mode)
         end_ok = bool(ts_max >= end_ts) or cls._is_tolerable_right_gap(ts_max, end_ts, minute_mode)
         return start_ok and end_ok
@@ -195,7 +196,16 @@ class TimeSeriesCache:
         ranges: list[tuple[str, str]] = []
 
         if minute_mode:
-            # Minute mode only appends forward; do not repeatedly chase historical left gaps.
+            # Minute feeds are windowed, but for user-selected ranges we still try to fill both edges.
+            if start_ts < ts_min and not cls._is_tolerable_left_gap(start_ts, ts_min, minute_mode):
+                left_end = ts_min - delta
+                if left_end >= start_ts:
+                    ranges.append(
+                        (
+                            cls._ts_to_range_text(start_ts, minute_mode),
+                            cls._ts_to_range_text(left_end, minute_mode),
+                        )
+                    )
             if end_ts > ts_max and not cls._is_tolerable_right_gap(ts_max, end_ts, minute_mode):
                 right_start = ts_max + delta
                 if right_start <= end_ts:
@@ -263,6 +273,10 @@ class TimeSeriesCache:
                 return False
             today = pd.Timestamp(datetime.now().date())
             end_day = end_ts.normalize()
+            tail_day = pd.Timestamp(ts_max).normalize()
+            # Same-session right-edge tiny gap (e.g. 14:59 vs 15:00) should not force a network fetch loop.
+            if tail_day == end_day and gap <= pd.Timedelta(minutes=5):
+                return True
             # Real-time minute feeds are often 1-5 minutes behind; avoid needless re-fetch loops.
             if end_day == today and gap <= pd.Timedelta(minutes=5):
                 return True

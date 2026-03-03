@@ -32,6 +32,13 @@
 pip install -r requirements.txt
 ```
 
+如遇到 `Connection aborted` / `RemoteDisconnected` 且终端出现
+`LibreSSL ... urllib3 v2 only supports OpenSSL 1.1.1+` 提示，请先执行：
+
+```bash
+python3 -m pip install --upgrade "urllib3<2"
+```
+
 ## 启动 GUI
 
 ```bash
