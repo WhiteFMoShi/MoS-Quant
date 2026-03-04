@@ -105,6 +105,31 @@ def _apply_dark_theme(app: QtWidgets.QApplication) -> None:
           padding: 10px;
         }
 
+        QFrame#QuickInput {
+          background-color: rgba(28, 28, 30, 0.94);
+          border: 1px solid rgba(58, 58, 60, 0.90);
+          border-radius: 14px;
+        }
+        QFrame#QuickInput[active="true"] {
+          border: 1px solid rgba(10, 132, 255, 0.85);
+        }
+        QLabel#QuickInputPrompt {
+          color: #8E8E93;
+          font-weight: 700;
+          padding-left: 12px;
+          padding-right: 6px;
+        }
+        QLineEdit#QuickInputEdit {
+          background: transparent;
+          border: none;
+          padding: 10px 12px 10px 0px;
+          color: #F2F2F7;
+          font-size: 13px;
+        }
+        QLineEdit#QuickInputEdit::placeholder {
+          color: #8E8E93;
+        }
+
         QFrame#Sidebar {
           background-color: #151517;
           border-right: 1px solid #2C2C2E;
@@ -499,6 +524,30 @@ class StartupWindow(QtWidgets.QWidget):
 
     @QtCore.Slot(str)
     def _on_log(self, msg: str) -> None:
+        progress_prefix = "[progress] "
+        if msg.startswith(progress_prefix):
+            payload = msg[len(progress_prefix) :].strip()
+            pct_str, _, text = payload.partition(" ")
+            try:
+                pct = max(0, min(100, int(pct_str)))
+            except Exception:
+                pct = 0
+
+            if self.progress.minimum() != 0 or self.progress.maximum() != 100:
+                self.progress.setRange(0, 100)
+                self.progress.setTextVisible(False)
+            self.progress.setValue(pct)
+
+            self._status_raw = text.strip() if text.strip() else f"{pct}%"
+            self._render_status()
+            return
+
+        status_prefix = "[status] "
+        if msg.startswith(status_prefix):
+            self._status_raw = msg[len(status_prefix) :]
+            self._render_status()
+            return
+
         self._status_raw = msg
         self._render_status()
         self.log_view.appendPlainText(msg)
@@ -516,8 +565,8 @@ class StartupWindow(QtWidgets.QWidget):
 
     @QtCore.Slot(object)
     def _on_succeeded(self, ctx: object) -> None:
-        self.progress.setRange(0, 1)
-        self.progress.setValue(1)
+        self.progress.setRange(0, 100)
+        self.progress.setValue(100)
         self._status_raw = "就绪，进入主界面…"
         self._render_status()
 

@@ -30,6 +30,15 @@ def _summarize_trade_calendar(trade_calendar: object) -> _CalendarSummary | None
         return None
 
 
+def _qt_key(name: str) -> int:
+    if hasattr(QtCore.Qt, name):
+        return int(getattr(QtCore.Qt, name))
+    qt_key = getattr(QtCore.Qt, "Key", None)
+    if qt_key is not None and hasattr(qt_key, name):
+        return int(getattr(qt_key, name))
+    raise AttributeError(f"Qt key not found: {name}")
+
+
 class _Card(QtWidgets.QFrame):
     def __init__(self, title: str, *, subtitle: str = "") -> None:
         super().__init__()
@@ -137,6 +146,72 @@ class _ElidedLabel(QtWidgets.QLabel):
         fm = self.fontMetrics()
         w = max(10, self.width())
         super().setText(fm.elidedText(self._raw, QtCore.Qt.ElideRight, w))
+
+
+class _QuickInputOverlay(QtWidgets.QFrame):
+    submitted = QtCore.Signal(str)
+    active_changed = QtCore.Signal(bool)
+
+    def __init__(self, parent: QtWidgets.QWidget) -> None:
+        super().__init__(parent)
+        self.setObjectName("QuickInput")
+        self.setAttribute(QtCore.Qt.WA_StyledBackground, True)
+        self.setVisible(False)
+
+        self._prompt = QtWidgets.QLabel("›")
+        self._prompt.setObjectName("QuickInputPrompt")
+
+        self._edit = QtWidgets.QLineEdit()
+        self._edit.setObjectName("QuickInputEdit")
+        self._edit.setPlaceholderText("输入…（Enter 提交，Esc 取消）")
+        self._edit.returnPressed.connect(self._on_return_pressed)
+        self._edit.installEventFilter(self)
+
+        lay = QtWidgets.QHBoxLayout()
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        lay.addWidget(self._prompt, 0)
+        lay.addWidget(self._edit, 1)
+        self.setLayout(lay)
+
+        self.setFixedSize(420, 44)
+
+        shadow = QtWidgets.QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(26)
+        shadow.setOffset(0, 10)
+        shadow.setColor(QtGui.QColor(0, 0, 0, 160))
+        self.setGraphicsEffect(shadow)
+
+    def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:  # noqa: N802
+        if obj is self._edit and event.type() in (QtCore.QEvent.FocusIn, QtCore.QEvent.FocusOut):
+            active = event.type() == QtCore.QEvent.FocusIn
+            self._set_active(active)
+            self.active_changed.emit(active)
+        return super().eventFilter(obj, event)
+
+    def show_and_focus(self) -> None:
+        self.setVisible(True)
+        self.raise_()
+        self._edit.setFocus(QtCore.Qt.ShortcutFocusReason)
+        self._edit.selectAll()
+
+    def hide_overlay(self) -> None:
+        self.setVisible(False)
+        self._edit.clear()
+        self._set_active(False)
+
+    def _set_active(self, active: bool) -> None:
+        self.setProperty("active", active)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
+    @QtCore.Slot()
+    def _on_return_pressed(self) -> None:
+        text = self._edit.text().strip()
+        if not text:
+            return
+        self.submitted.emit(text)
 
 
 class _ProbeTable(QtWidgets.QTableWidget):
@@ -1014,6 +1089,7 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("MoS Quant")
         self.resize(1040, 680)
+        self._quick_input_last_focus: QtWidgets.QWidget | None = None
 
         # ---- sidebar ----
         sidebar = QtWidgets.QFrame()
@@ -1078,3 +1154,81 @@ class MainWindow(QtWidgets.QMainWindow):
         root_l.addWidget(content, 1)
         root.setLayout(root_l)
         self.setCentralWidget(root)
+
+        # ---- quick input overlay (Enter to show, Esc to hide) ----
+        self._quick_input = _QuickInputOverlay(root)
+        self._quick_input.submitted.connect(self._on_quick_input_submitted)
+        self._quick_input.active_changed.connect(self._on_quick_input_active_changed)
+        self._reposition_quick_input()
+
+        self._show_quick_input_return = QtGui.QShortcut(
+            QtGui.QKeySequence(_qt_key("Key_Return")),
+            self,
+        )
+        self._show_quick_input_return.setContext(QtCore.Qt.ApplicationShortcut)
+        self._show_quick_input_return.activated.connect(self._show_quick_input)
+
+        self._show_quick_input_enter = QtGui.QShortcut(
+            QtGui.QKeySequence(_qt_key("Key_Enter")),
+            self,
+        )
+        self._show_quick_input_enter.setContext(QtCore.Qt.ApplicationShortcut)
+        self._show_quick_input_enter.activated.connect(self._show_quick_input)
+
+        self._hide_quick_input_esc = QtGui.QShortcut(
+            QtGui.QKeySequence(_qt_key("Key_Escape")),
+            self,
+        )
+        self._hide_quick_input_esc.setContext(QtCore.Qt.ApplicationShortcut)
+        self._hide_quick_input_esc.activated.connect(self._hide_quick_input)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._reposition_quick_input()
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:  # noqa: N802
+        super().showEvent(event)
+        self._reposition_quick_input()
+
+    def _reposition_quick_input(self) -> None:
+        host = self.centralWidget()
+        if host is None or not hasattr(self, "_quick_input"):
+            return
+        margin = 18
+        w = self._quick_input.width()
+        h = self._quick_input.height()
+        x = max(0, host.width() - w - margin)
+        y = max(0, host.height() - h - margin)
+        self._quick_input.move(x, y)
+
+    @QtCore.Slot()
+    def _show_quick_input(self) -> None:
+        if self._quick_input.isVisible():
+            self._quick_input.show_and_focus()
+            return
+        self._quick_input_last_focus = QtWidgets.QApplication.focusWidget()
+        self._reposition_quick_input()
+        self._quick_input.show_and_focus()
+
+    @QtCore.Slot()
+    def _hide_quick_input(self) -> None:
+        if not self._quick_input.isVisible():
+            return
+        self._quick_input.hide_overlay()
+        self._show_quick_input_return.setEnabled(True)
+        self._show_quick_input_enter.setEnabled(True)
+        if self._quick_input_last_focus is not None:
+            try:
+                self._quick_input_last_focus.setFocus(QtCore.Qt.ShortcutFocusReason)
+            except Exception:
+                pass
+        self._quick_input_last_focus = None
+
+    @QtCore.Slot(bool)
+    def _on_quick_input_active_changed(self, active: bool) -> None:
+        self._show_quick_input_return.setEnabled(not active)
+        self._show_quick_input_enter.setEnabled(not active)
+
+    @QtCore.Slot(str)
+    def _on_quick_input_submitted(self, _text: str) -> None:
+        self._hide_quick_input()

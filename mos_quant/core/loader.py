@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+import threading
+import time
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -47,11 +49,16 @@ class LoaderConfig:
     trade_calendar_freshness: FreshnessLevel = FreshnessLevel.DAY
     trade_calendar_request_timeout: float = 10.0
 
+    # Step 4: A-share stock list cache (for local fuzzy match / quick search)
+    stock_list_cache_dir: Path = Path("cache/market/stock_list")
+    stock_list_freshness: FreshnessLevel = FreshnessLevel.DAY
+
 
 @dataclass(frozen=True)
 class LoaderContext:
     default_url: str
     trade_calendar: pd.DataFrame
+    a_stock_list: pd.DataFrame
     probe_results: list[ProbeResult]
 
 
@@ -62,6 +69,45 @@ def _now_iso() -> str:
 def _write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _normalize_trade_date_series(values: pd.Series) -> pd.Series:
+    """
+    Normalize a series of mixed date-like values into python `date` objects.
+
+    Upstream sources sometimes mix formats like:
+    - 1991-01-02
+    - 1991-01-02T00:00:00.000Z
+    - 1991-Jan-02T00:00:00.000Z
+    - 19910102
+    """
+    s = values.copy()
+    try:
+        dt = pd.to_datetime(s, utc=True, errors="coerce", format="mixed")
+    except Exception:
+        dt = pd.to_datetime(s, utc=True, errors="coerce")
+
+    if dt.isna().any():
+        # Fallback 1: compact YYYYMMDD tokens.
+        try:
+            dt2 = pd.to_datetime(s.astype(str), utc=True, errors="coerce", format="%Y%m%d")
+            dt = dt.fillna(dt2)
+        except Exception:
+            pass
+
+    if dt.isna().any():
+        # Fallback 2: force strings and let pandas infer per-element.
+        try:
+            dt3 = pd.to_datetime(s.astype(str), utc=True, errors="coerce", format="mixed")
+        except Exception:
+            dt3 = pd.to_datetime(s.astype(str), utc=True, errors="coerce")
+        dt = dt.fillna(dt3)
+
+    if dt.isna().any():
+        bad = s[dt.isna()].astype(str).head(3).tolist()
+        raise LoaderError(f"Failed to parse trade_date tokens (sample={bad}).")
+
+    return dt.dt.date
 
 
 def fetch_trade_calendar_from_sina_url(url: str, timeout: float = 10.0) -> pd.DataFrame:
@@ -108,7 +154,7 @@ def fetch_trade_calendar_from_sina_url(url: str, timeout: float = 10.0) -> pd.Da
             js.eval(hk_js_decode)
             decoded = js.call("d", encoded)
             df = pd.DataFrame(decoded, columns=["trade_date"])
-            df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
+            df["trade_date"] = _normalize_trade_date_series(df["trade_date"])
 
             # Sina omits 1992-05-04 (known AkShare fix)
             dates = df["trade_date"].tolist()
@@ -146,14 +192,18 @@ def fetch_trade_calendar_from_url(url: str, timeout: float = 10.0) -> pd.DataFra
     if "var datelist" in text and "=" in text:
         return fetch_trade_calendar_from_sina_url(url, timeout=timeout)
 
-    # Fallback: extract many date tokens and treat them as trade dates.
-    iso_dates = re.findall(r"\b(?:19|20)\d{2}-\d{2}-\d{2}\b", text)
+    # Fallback: extract many date/datetime tokens and treat them as trade dates.
+    # Examples: 2025-01-02, 2025-01-02T00:00:00.000Z
+    iso_dates = re.findall(
+        r"\b(?:19|20)\d{2}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?\b",
+        text,
+    )
     compact_dates = re.findall(r"\b(?:19|20)\d{6}\b", text)
 
     parsed: list[date] = []
     for token in iso_dates:
         try:
-            parsed.append(pd.to_datetime(token).date())
+            parsed.append(pd.to_datetime(token, utc=True).date())
         except Exception:
             pass
     for token in compact_dates:
@@ -171,6 +221,76 @@ def fetch_trade_calendar_from_url(url: str, timeout: float = 10.0) -> pd.DataFra
     return pd.DataFrame({"trade_date": parsed})
 
 
+def fetch_a_stock_list_from_akshare() -> pd.DataFrame:
+    """
+    Fetch CN A-share stock list (code + name) from AkShare.
+
+    This is used for local fuzzy matching / quick search UI.
+    """
+    try:
+        import akshare as ak  # type: ignore
+    except Exception as exc:  # pragma: no cover
+        raise LoaderError(f"Missing dependency AkShare: {exc}") from exc
+
+    fetch_fns = []
+    if hasattr(ak, "stock_info_a_code_name"):
+        fetch_fns.append(("stock_info_a_code_name", getattr(ak, "stock_info_a_code_name")))
+    if hasattr(ak, "stock_zh_a_spot_em"):
+        fetch_fns.append(("stock_zh_a_spot_em", getattr(ak, "stock_zh_a_spot_em")))
+    if hasattr(ak, "stock_zh_a_spot"):
+        fetch_fns.append(("stock_zh_a_spot", getattr(ak, "stock_zh_a_spot")))
+
+    last_exc: Exception | None = None
+    df: pd.DataFrame | None = None
+    for name, fn in fetch_fns:
+        try:
+            df = fn()
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                break
+        except Exception as exc:
+            last_exc = exc
+            df = None
+
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        if isinstance(last_exc, json.JSONDecodeError):
+            detail = (
+                ": JSONDecodeError: 返回内容不是JSON（通常是HTML页面，以'<'开头，可能是验证码/拦截/重定向/临时故障）"
+            )
+        else:
+            detail = "" if last_exc is None else f": {type(last_exc).__name__}: {last_exc}"
+        raise LoaderError(f"Failed to fetch A-share stock list from AkShare{detail}")
+
+    def pick_col(candidates: tuple[str, ...]) -> str | None:
+        cols = set(map(str, df.columns))
+        for c in candidates:
+            if c in cols:
+                return c
+        return None
+
+    col_code = pick_col(("code", "代码", "symbol", "股票代码", "证券代码"))
+    col_name = pick_col(("名称", "name", "股票简称", "证券简称"))
+    if col_code is None or col_name is None:
+        raise LoaderError(
+            f"Unsupported stock list schema from AkShare: "
+            f"missing columns code={col_code!r} name={col_name!r}; "
+            f"available={list(map(str, df.columns))}"
+        )
+
+    out = pd.DataFrame(
+        {
+            "code": df[col_code].astype(str).str.strip(),
+            "name": df[col_name].astype(str).str.strip(),
+        }
+    )
+    out = out[(out["code"] != "") & (out["code"].str.lower() != "nan")]
+    out = out[(out["name"] != "") & (out["name"].str.lower() != "nan")]
+    out = out.drop_duplicates(subset=["code"], keep="first").sort_values("code").reset_index(drop=True)
+
+    if out.empty:
+        raise LoaderError("A-share stock list fetch returned empty after normalization.")
+    return out
+
+
 class MoSQuantLoader:
     """
     MoS Quant loader (portal) with fail-fast semantics.
@@ -179,6 +299,7 @@ class MoSQuantLoader:
     1) Probe connectivity for all configured URLs.
     2) Choose the best URL as default source.
     3) Fetch trade calendar from the default URL and cache it locally.
+    4) Fetch A-share stock list and cache it locally.
 
     If any step fails, raise LoaderError and stop.
     """
@@ -189,7 +310,9 @@ class MoSQuantLoader:
         *,
         probe: DataSourceProbe | None = None,
         cache: FileCache | None = None,
+        stock_cache: FileCache | None = None,
         calendar_fetcher: Callable[[str, float], pd.DataFrame] | None = None,
+        stock_list_fetcher: Callable[[], pd.DataFrame] | None = None,
     ) -> None:
         self.config = config or LoaderConfig()
         self.probe = probe or DataSourceProbe(
@@ -199,7 +322,9 @@ class MoSQuantLoader:
             config_path=self.config.probe_urls_path,
         )
         self.cache = cache or FileCache(base_dir=self.config.trade_calendar_cache_dir)
+        self.stock_cache = stock_cache or FileCache(base_dir=self.config.stock_list_cache_dir)
         self.calendar_fetcher = calendar_fetcher or fetch_trade_calendar_from_url
+        self.stock_list_fetcher = stock_list_fetcher or fetch_a_stock_list_from_akshare
 
     def step1_probe_sources(self) -> list[ProbeResult]:
         results = self.probe.probe_all()
@@ -240,6 +365,35 @@ class MoSQuantLoader:
         self.cache.set_df(key, self.config.trade_calendar_freshness, df)
         return df
 
+    def step4_get_a_stock_list(self) -> pd.DataFrame:
+        key = CacheKey(namespace="a_stock_list", params={"market": "CN_A"})
+        cached = self.stock_cache.get_df(key, self.config.stock_list_freshness)
+        if cached is not None and not cached.empty:
+            return cached
+
+        try:
+            df = self.stock_list_fetcher()
+        except LoaderError:
+            raise
+        except Exception as exc:
+            raise LoaderError(f"A-share stock list fetch failed: {type(exc).__name__}: {exc}") from exc
+
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            raise LoaderError("A-share stock list fetch returned empty DataFrame.")
+        if "code" not in df.columns or "name" not in df.columns:
+            raise LoaderError("A-share stock list DataFrame must contain columns 'code' and 'name'.")
+
+        df = df[["code", "name"]].copy()
+        df["code"] = df["code"].astype(str).str.strip()
+        df["name"] = df["name"].astype(str).str.strip()
+        df = df[(df["code"] != "") & (df["name"] != "")]
+        df = df.drop_duplicates(subset=["code"], keep="first").sort_values("code").reset_index(drop=True)
+        if df.empty:
+            raise LoaderError("A-share stock list became empty after normalization.")
+
+        self.stock_cache.set_df(key, self.config.stock_list_freshness, df)
+        return df
+
     def _persist_default_source(self, url: str, best: ProbeResult) -> None:
         record = DefaultSourceRecord(
             url=url,
@@ -256,7 +410,42 @@ class MoSQuantLoader:
             if progress_cb is not None:
                 progress_cb(msg)
 
-        log("Step 1/3: probing data sources ...")
+        def emit_progress(pct: int, text: str) -> None:
+            safe_pct = max(0, min(100, int(pct)))
+            log(f"[progress] {safe_pct} {text}")
+
+        def call_with_progress_heartbeat(
+            *,
+            status_prefix: str,
+            base_pct: int,
+            max_pct: int,
+            fn: Callable[[], pd.DataFrame],
+            interval_seconds: float = 1.0,
+        ) -> pd.DataFrame:
+            stop = threading.Event()
+            started = time.monotonic()
+
+            def tick() -> None:
+                while not stop.wait(max(0.2, float(interval_seconds))):
+                    elapsed = int(time.monotonic() - started)
+                    # We can't get true network progress from upstream APIs; show a smooth,
+                    # monotonic estimate to reassure users the app is still working.
+                    span = max(1, int(max_pct) - int(base_pct))
+                    k = 10.0  # larger -> slower ramp
+                    est = int(base_pct + span * (elapsed / (elapsed + k)))
+                    est = max(int(base_pct), min(int(max_pct), est))
+                    emit_progress(est, f"{status_prefix}  {est}%（已用时 {elapsed}s）")
+
+            t = threading.Thread(target=tick, name="mos_quant_loader_heartbeat", daemon=True)
+            t.start()
+            try:
+                return fn()
+            finally:
+                stop.set()
+                t.join(timeout=max(0.2, float(interval_seconds)) * 2.0)
+
+        emit_progress(2, "正在探测数据源…")
+        log("Step 1/4: probing data sources ...")
         results = self.step1_probe_sources()
         best = self._best_result(results)
         log(
@@ -265,19 +454,41 @@ class MoSQuantLoader:
             f"latency_ms={best.avg_latency_ms:.1f}"
         )
 
-        log("Step 2/3: choosing default source ...")
+        emit_progress(25, "数据源探测完成")
+        log("Step 2/4: choosing default source ...")
         default_url = self.step2_choose_default(results)
         log(f"Default source selected: {default_url}")
 
-        log("Step 3/3: fetching trade calendar (with local cache) ...")
-        trade_calendar = self.step3_get_trade_calendar(default_url)
+        emit_progress(50, "已选择默认数据源")
+        log("Step 3/4: fetching trade calendar (with local cache) ...")
+        trade_calendar = call_with_progress_heartbeat(
+            status_prefix="正在获取交易日历…",
+            base_pct=50,
+            max_pct=74,
+            fn=lambda: self.step3_get_trade_calendar(default_url),
+            interval_seconds=1.0,
+        )
         log(f"Trade calendar ready: rows={len(trade_calendar)}")
+        emit_progress(75, f"交易日历就绪：{len(trade_calendar)} 行")
+
+        log("Step 4/4: fetching A-share stock list (with local cache) ...")
+        a_stock_list = call_with_progress_heartbeat(
+            status_prefix="正在获取A股股票列表…",
+            base_pct=75,
+            max_pct=99,
+            fn=self.step4_get_a_stock_list,
+            interval_seconds=1.0,
+        )
+        log(f"A-share stock list ready: rows={len(a_stock_list)}")
+        emit_progress(99, f"A股股票列表就绪：{len(a_stock_list)} 只")
 
         self._persist_default_source(default_url, best)
         log(f"Default source saved to {self.config.default_source_path}")
+        emit_progress(100, "就绪，进入主界面…")
         return LoaderContext(
             default_url=default_url,
             trade_calendar=trade_calendar,
+            a_stock_list=a_stock_list,
             probe_results=results,
         )
 
