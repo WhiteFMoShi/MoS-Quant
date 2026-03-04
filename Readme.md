@@ -14,28 +14,10 @@
 python3 -m pip install -r requirements.txt
 ```
 
-启动 GUI（兼容入口）：
+启动 GUI：
 
 ```bash
 python3 main.py
-```
-
-不装 GUI 依赖时（仅终端运行 loader）：
-
-```bash
-python3 main.py --headless
-```
-
-推荐入口（可选）：
-
-```bash
-python3 -m mos_quant
-```
-
-仅在终端运行 loader（无 GUI）：
-
-```bash
-python3 -m mos_quant --headless
 ```
 
 ## 项目结构
