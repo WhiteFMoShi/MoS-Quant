@@ -9,7 +9,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--headless",
         action="store_true",
-        help="Run loader in terminal mode (no GUI).",
+        help="在终端运行 loader（不启动 GUI）。",
     )
     return parser.parse_args(argv)
 
@@ -26,12 +26,12 @@ def main(argv: list[str] | None = None) -> int:
         from mos_quant.ui.qt_app import main as gui_main
     except Exception as exc:
         print(
-            "GUI dependencies are not available.\n\n"
+            "GUI 依赖不可用。\n\n"
             f"- Python: {sys.executable}\n"
-            f"- Error: {type(exc).__name__}: {exc}\n\n"
-            "Fix:\n"
-            "- Install deps: python3 -m pip install -r requirements.txt\n"
-            "- Or run headless: python3 main.py --headless\n",
+            f"- 错误: {type(exc).__name__}: {exc}\n\n"
+            "解决方法：\n"
+            "- 安装依赖：python3 -m pip install -r requirements.txt\n"
+            "- 或仅终端运行：python3 main.py --headless\n",
             file=sys.stderr,
         )
         return 1

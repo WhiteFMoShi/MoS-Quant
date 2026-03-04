@@ -9,7 +9,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--headless",
         action="store_true",
-        help="Run loader in terminal mode (no GUI).",
+        help="在终端运行 loader（不启动 GUI）。",
     )
     return parser.parse_args(argv)
 

@@ -23,6 +23,7 @@ def _apply_dark_theme(app: QtWidgets.QApplication) -> None:
 
     # Prefer Apple-like typography when available, with sensible fallbacks.
     preferred_families = [
+        "PingFang SC",
         "SF Pro Text",
         "SF Pro Display",
         "Helvetica Neue",
@@ -39,14 +40,15 @@ def _apply_dark_theme(app: QtWidgets.QApplication) -> None:
         pass
 
     palette = QtGui.QPalette()
-    palette.setColor(QtGui.QPalette.Window, QtGui.QColor("#0B0B0C"))
+    # Slightly lifted background to avoid harsh "pure black" bands between surfaces.
+    palette.setColor(QtGui.QPalette.Window, QtGui.QColor("#0F0F10"))
     palette.setColor(QtGui.QPalette.WindowText, QtGui.QColor("#F2F2F7"))
-    palette.setColor(QtGui.QPalette.Base, QtGui.QColor("#121214"))
+    palette.setColor(QtGui.QPalette.Base, QtGui.QColor("#141416"))
     palette.setColor(QtGui.QPalette.AlternateBase, QtGui.QColor("#1C1C1E"))
     palette.setColor(QtGui.QPalette.ToolTipBase, QtGui.QColor("#1C1C1E"))
     palette.setColor(QtGui.QPalette.ToolTipText, QtGui.QColor("#F2F2F7"))
     palette.setColor(QtGui.QPalette.Text, QtGui.QColor("#F2F2F7"))
-    palette.setColor(QtGui.QPalette.Button, QtGui.QColor("#2C2C2E"))
+    palette.setColor(QtGui.QPalette.Button, QtGui.QColor("#1C1C1E"))
     palette.setColor(QtGui.QPalette.ButtonText, QtGui.QColor("#F2F2F7"))
     palette.setColor(QtGui.QPalette.BrightText, QtGui.QColor("#FF453A"))
     palette.setColor(QtGui.QPalette.Highlight, QtGui.QColor("#0A84FF"))
@@ -56,15 +58,19 @@ def _apply_dark_theme(app: QtWidgets.QApplication) -> None:
     # Apple-esque: compact card, subtle borders, blue accent.
     app.setStyleSheet(
         """
-        QWidget {
-          background-color: #0B0B0C;
-          color: #F2F2F7;
-        }
+        QWidget { color: #F2F2F7; }
+        QLabel { background: transparent; }
 
         QFrame#Card {
           background-color: #1C1C1E;
           border: 1px solid #2C2C2E;
           border-radius: 14px;
+        }
+
+        QLabel#H1 {
+          font-size: 18px;
+          font-weight: 650;
+          color: #F2F2F7;
         }
 
         QLabel#Title {
@@ -93,10 +99,214 @@ def _apply_dark_theme(app: QtWidgets.QApplication) -> None:
         }
 
         QPlainTextEdit#LogView {
-          background-color: #121214;
+          background-color: #141416;
           border: 1px solid #2C2C2E;
           border-radius: 10px;
           padding: 10px;
+        }
+
+        QFrame#Sidebar {
+          background-color: #151517;
+          border-right: 1px solid #2C2C2E;
+        }
+
+        QLabel#Brand {
+          font-size: 14px;
+          font-weight: 700;
+          color: #F2F2F7;
+        }
+
+        QListWidget#NavList {
+          background: transparent;
+          border: none;
+          outline: none;
+        }
+        QListWidget#NavList::item {
+          padding: 8px 6px;
+          border-radius: 10px;
+          color: #F2F2F7;
+        }
+        QListWidget#NavList::item:selected {
+          background: rgba(10, 132, 255, 0.20);
+          color: #F2F2F7;
+        }
+        QListWidget#NavList::item:hover {
+          background: rgba(242, 242, 247, 0.08);
+        }
+
+        QFrame#Header {
+          background-color: #1C1C1E;
+          border: 1px solid #2C2C2E;
+          border-radius: 14px;
+        }
+
+        QLabel#CardTitle {
+          font-size: 13px;
+          font-weight: 650;
+          color: #F2F2F7;
+        }
+        QLabel#CardSubtitle {
+          color: #8E8E93;
+        }
+
+        QLabel#InfoName {
+          font-size: 13px;
+          font-weight: 700;
+          color: #F2F2F7;
+        }
+        QLabel#InfoIndustry {
+          color: #8E8E93;
+        }
+        QLabel#CodePill {
+          background-color: rgba(142, 142, 147, 0.14);
+          border: 1px solid rgba(58, 58, 60, 0.90);
+          border-radius: 9px;
+          padding: 2px 6px;
+          color: #F2F2F7;
+          font-weight: 650;
+          min-height: 18px;
+        }
+
+        QLabel#RangeLabel {
+          color: #8E8E93;
+        }
+
+        QLabel#KeyLabel {
+          color: #8E8E93;
+        }
+        QLabel#ValueLabel {
+          color: #F2F2F7;
+        }
+        QLabel#SectionLabel {
+          color: #8E8E93;
+          font-size: 12px;
+          font-weight: 650;
+          padding-top: 6px;
+        }
+
+        QTableWidget#ProbeTable {
+          background-color: #141416;
+          border: 1px solid #2C2C2E;
+          border-radius: 10px;
+          gridline-color: transparent;
+          selection-background-color: transparent;
+        }
+        QTableWidget#WatchTable {
+          background-color: #141416;
+          border: 1px solid #2C2C2E;
+          border-radius: 12px;
+          gridline-color: transparent;
+          selection-background-color: transparent;
+        }
+        QTableWidget#WatchTable::item {
+          padding: 8px 10px;
+          border-bottom: 1px solid rgba(58, 58, 60, 0.45);
+        }
+        QTableWidget#WatchTable::item:selected {
+          background: rgba(10, 132, 255, 0.18);
+        }
+        QHeaderView#WatchHeader::section {
+          background-color: #1C1C1E;
+          color: #8E8E93;
+          border: none;
+          padding: 8px 10px;
+          font-weight: 650;
+        }
+        QHeaderView#WatchHeader::section:horizontal {
+          border-right: 1px solid rgba(58, 58, 60, 0.45);
+        }
+        QHeaderView::section {
+          background-color: #1C1C1E;
+          color: #8E8E93;
+          border: none;
+          padding: 6px 8px;
+        }
+
+        QFrame#MarketToolbar {
+          background-color: #151517;
+          border: 1px solid #2C2C2E;
+          border-radius: 12px;
+        }
+        QToolButton#TfButton {
+          color: #A1A1A6;
+          border: 1px solid transparent;
+          border-radius: 10px;
+          padding: 6px 10px;
+          background: transparent;
+        }
+        QToolButton#TfButton:checked {
+          color: #F2F2F7;
+          background: rgba(242, 242, 247, 0.10);
+          border: 1px solid rgba(58, 58, 60, 0.90);
+        }
+        QToolButton#TfButton:hover {
+          color: #F2F2F7;
+          background: rgba(242, 242, 247, 0.06);
+        }
+        QScrollArea#TfScroll {
+          background: transparent;
+        }
+        QComboBox#MarketType {
+          background-color: #141416;
+          border: 1px solid #2C2C2E;
+          border-radius: 10px;
+          padding: 6px 10px;
+          min-width: 140px;
+        }
+        QComboBox#MarketType::drop-down {
+          border: none;
+          width: 22px;
+        }
+
+        QComboBox#TfCombo {
+          background-color: #141416;
+          border: 1px solid #2C2C2E;
+          border-radius: 10px;
+          padding: 6px 10px;
+          min-width: 120px;
+        }
+        QComboBox#TfCombo::drop-down {
+          border: none;
+          width: 22px;
+        }
+
+        QFrame#InfoTabBar {
+          background: transparent;
+        }
+        QToolButton#InfoTabButton {
+          background: #1C1C1E;
+          border: 1px solid #2C2C2E;
+          border-radius: 10px;
+          padding: 6px 10px;
+          color: #8E8E93;
+        }
+        QToolButton#InfoTabButton:checked {
+          background: rgba(242, 242, 247, 0.10);
+          color: #F2F2F7;
+        }
+        QToolButton#InfoTabButton:hover {
+          background: rgba(242, 242, 247, 0.08);
+          color: #F2F2F7;
+        }
+
+        QScrollArea#InfoScroll {
+          background-color: #1C1C1E;
+        }
+        QScrollArea#InfoScroll QWidget#qt_scrollarea_viewport {
+          background-color: #1C1C1E;
+        }
+        QStackedWidget#InfoPages {
+          background: transparent;
+        }
+
+        QFrame#InfoDivider {
+          border: none;
+          background-color: #2C2C2E;
+          max-height: 1px;
+        }
+
+        QLabel#PlaceholderHint {
+          color: #8E8E93;
         }
 
         QToolButton {
@@ -140,7 +350,7 @@ def _apply_dark_theme(app: QtWidgets.QApplication) -> None:
 
 
 def _set_app_icon(app: QtWidgets.QApplication) -> None:
-    icon_path = _repo_root() / "img" / "icon" / "icon.png"
+    icon_path = _repo_root() / "img" / "icon.png"
     if icon_path.exists():
         app.setWindowIcon(QtGui.QIcon(str(icon_path)))
 
@@ -177,12 +387,12 @@ class StartupWindow(QtWidgets.QWidget):
         self.setMinimumSize(520, 320)
         self.resize(560, 340)
 
-        self._status_raw = "Preparing …"
+        self._status_raw = "正在准备…"
 
         # --- header ---
         icon = QtWidgets.QLabel()
         icon.setFixedSize(44, 44)
-        icon_path = _repo_root() / "img" / "icon" / "icon.png"
+        icon_path = _repo_root() / "img" / "icon.png"
         if icon_path.exists():
             pm = QtGui.QPixmap(str(icon_path))
             icon.setPixmap(pm.scaled(44, 44, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
@@ -190,7 +400,7 @@ class StartupWindow(QtWidgets.QWidget):
         title = QtWidgets.QLabel("MoS Quant")
         title.setObjectName("Title")
 
-        subtitle = QtWidgets.QLabel("Loader")
+        subtitle = QtWidgets.QLabel("启动加载")
         subtitle.setObjectName("Subtitle")
 
         title_col = QtWidgets.QVBoxLayout()
@@ -224,12 +434,12 @@ class StartupWindow(QtWidgets.QWidget):
         self.details_btn = QtWidgets.QToolButton()
         self.details_btn.setCheckable(True)
         self.details_btn.setChecked(False)
-        self.details_btn.setText("Details")
+        self.details_btn.setText("详情")
         self.details_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
         self.details_btn.setArrowType(QtCore.Qt.RightArrow)
         self.details_btn.toggled.connect(self._toggle_details)
 
-        self.quit_btn = QtWidgets.QPushButton("Cancel")
+        self.quit_btn = QtWidgets.QPushButton("取消")
         self.quit_btn.clicked.connect(QtWidgets.QApplication.quit)
 
         footer = QtWidgets.QHBoxLayout()
@@ -297,63 +507,26 @@ class StartupWindow(QtWidgets.QWidget):
     def _on_failed(self, detail: str) -> None:
         self.progress.setRange(0, 1)
         self.progress.setValue(1)
-        self._status_raw = "Loader failed (fail-fast)."
+        self._status_raw = "加载失败（快速失败）。"
         self._render_status()
         self.details_btn.setChecked(True)
 
-        QtWidgets.QMessageBox.critical(self, "MoS Quant Loader Error", detail)
+        QtWidgets.QMessageBox.critical(self, "MoS Quant 启动错误", detail)
         QtWidgets.QApplication.quit()
 
     @QtCore.Slot(object)
     def _on_succeeded(self, ctx: object) -> None:
         self.progress.setRange(0, 1)
         self.progress.setValue(1)
-        self._status_raw = "Ready. Entering main program …"
+        self._status_raw = "就绪，进入主界面…"
         self._render_status()
+
+        from mos_quant.ui.main_window import MainWindow
 
         win = MainWindow(ctx)
         win.show()
         self.close()
         self._main_window = win  # keep ref
-
-
-class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self, ctx: object) -> None:
-        super().__init__()
-        self.setWindowTitle("MoS Quant")
-        self.resize(900, 560)
-
-        # ctx is LoaderContext from mos_quant.core.loader
-        default_url = getattr(ctx, "default_url", "")
-        trade_calendar = getattr(ctx, "trade_calendar", None)
-
-        info = QtWidgets.QLabel()
-        info.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        info.setFont(QtGui.QFont("Menlo", 12))
-
-        if hasattr(trade_calendar, "__len__") and len(trade_calendar) > 0:
-            first = trade_calendar["trade_date"].iloc[0]
-            last = trade_calendar["trade_date"].iloc[-1]
-            rows = len(trade_calendar)
-            info.setText(
-                "Default data source:\n"
-                f"{default_url}\n\n"
-                "Trade calendar cached locally.\n"
-                f"Rows: {rows}\n"
-                f"Range: {first} .. {last}\n"
-            )
-        else:
-            info.setText(
-                "Default data source:\n"
-                f"{default_url}\n\n"
-                "Trade calendar: (empty)\n"
-            )
-
-        central = QtWidgets.QWidget()
-        layout = QtWidgets.QVBoxLayout()
-        layout.addWidget(info)
-        central.setLayout(layout)
-        self.setCentralWidget(central)
 
 
 def main() -> int:
