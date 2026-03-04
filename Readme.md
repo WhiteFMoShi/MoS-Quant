@@ -43,7 +43,7 @@ python3 -m mos_quant --headless
 ```text
 .
 ├── mos_quant/                 # 主包（实现都在这里）
-│   ├── cache/                 # FileCache 等缓存工具
+│   ├── caching/               # FileCache / TimeSeriesCache 等缓存工具
 │   ├── core/                  # loader/启动编排
 │   ├── data/                  # 网络探测、AkShare fetcher
 │   └── ui/                    # GUI（可选）

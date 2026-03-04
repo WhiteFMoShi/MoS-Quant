@@ -1,3 +1,5 @@
+"""Incremental cache helpers for time-series datasets."""
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -324,4 +326,3 @@ class TimeSeriesCache:
         if minute_mode:
             return ts.strftime("%Y-%m-%d %H:%M:%S")
         return ts.strftime("%Y%m%d")
-

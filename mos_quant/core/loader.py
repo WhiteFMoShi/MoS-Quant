@@ -10,7 +10,7 @@ from typing import Callable
 import pandas as pd
 import requests
 
-from ..cache.store import CacheKey, FileCache, FreshnessLevel
+from ..caching.file_cache import CacheKey, FileCache, FreshnessLevel
 from ..data.network_probe import DataSourceProbe, ProbeResult
 
 

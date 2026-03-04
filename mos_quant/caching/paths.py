@@ -4,7 +4,7 @@ from pathlib import Path
 
 
 def project_root() -> Path:
-    # mos_quant/cache/paths.py -> <root>/mos_quant/cache/paths.py
+    # mos_quant/caching/paths.py -> <root>/mos_quant/caching/paths.py
     return Path(__file__).resolve().parents[2]
 
 
@@ -18,4 +18,3 @@ def legacy_cache_roots() -> list[Path]:
         root / "GUI" / "cache",
         root / "GUI" / "windows" / "cache",
     ]
-

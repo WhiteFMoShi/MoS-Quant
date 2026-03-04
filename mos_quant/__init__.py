@@ -2,7 +2,7 @@
 
 This package contains:
 - data: upstream data source probing and AkShare fetcher
-- cache: local dataframe cache
+- caching: cache helpers (generic + time-series)
 - core: loader/bootstrapping logic
 
 UI code lives in mos_quant.ui and is intentionally not imported here.
@@ -10,7 +10,9 @@ UI code lives in mos_quant.ui and is intentionally not imported here.
 
 from typing import TYPE_CHECKING
 
-from .cache.store import CacheKey, DataFormat, FileCache, FreshnessLevel
+from .caching.file_cache import CacheKey, DataFormat, FileCache, FreshnessLevel
+from .caching.series_cache_manager import SeriesCacheManager
+from .caching.timeseries_cache import TimeSeriesCache
 from .core.loader import LoaderConfig, LoaderContext, LoaderError, MoSQuantLoader
 from .data.akshare_fetcher import AKShareStockFetcher, DataFetchError, FetchConfig, SourceRoute
 
@@ -32,6 +34,8 @@ __all__ = [
     "CacheKey",
     "FreshnessLevel",
     "DataFormat",
+    "TimeSeriesCache",
+    "SeriesCacheManager",
     "MoSQuantLoader",
     "LoaderConfig",
     "LoaderContext",

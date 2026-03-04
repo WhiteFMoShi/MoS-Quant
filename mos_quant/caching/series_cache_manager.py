@@ -1,3 +1,5 @@
+"""Manager wrapper for time-series cache + meta IO."""
+
 from __future__ import annotations
 
 import json
@@ -97,4 +99,3 @@ class SeriesCacheManager:
 
     def normalize(self, df: pd.DataFrame, minute_mode: bool) -> pd.DataFrame:
         return self._cache.normalize(df, minute_mode)
-

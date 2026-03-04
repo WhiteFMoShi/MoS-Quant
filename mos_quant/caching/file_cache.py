@@ -1,3 +1,5 @@
+"""Generic on-disk cache for pandas DataFrames."""
+
 from __future__ import annotations
 
 import json
