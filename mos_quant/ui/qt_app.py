@@ -108,7 +108,7 @@ def _apply_dark_theme(app: QtWidgets.QApplication) -> None:
         QFrame#QuickInput {
           background-color: rgba(28, 28, 30, 0.94);
           border: 1px solid rgba(58, 58, 60, 0.90);
-          border-radius: 14px;
+          border-radius: 12px;
         }
         QFrame#QuickInput[active="true"] {
           border: 1px solid rgba(10, 132, 255, 0.85);
@@ -116,18 +116,44 @@ def _apply_dark_theme(app: QtWidgets.QApplication) -> None:
         QLabel#QuickInputPrompt {
           color: #8E8E93;
           font-weight: 700;
-          padding-left: 12px;
+          padding-left: 8px;
           padding-right: 6px;
         }
         QLineEdit#QuickInputEdit {
           background: transparent;
           border: none;
-          padding: 10px 12px 10px 0px;
+          padding: 7px 10px 7px 0px;
           color: #F2F2F7;
-          font-size: 13px;
+          font-size: 12px;
         }
         QLineEdit#QuickInputEdit::placeholder {
           color: #8E8E93;
+        }
+
+        QFrame#QuickInputSuggest {
+          background-color: rgba(28, 28, 30, 0.96);
+          border: 1px solid rgba(58, 58, 60, 0.92);
+          border-radius: 12px;
+        }
+        QFrame#QuickInputSuggest[active="true"] {
+          border: 1px solid rgba(10, 132, 255, 0.70);
+        }
+        QListWidget#QuickInputSuggestList {
+          background: transparent;
+          border: none;
+          outline: none;
+        }
+        QListWidget#QuickInputSuggestList::item {
+          padding: 5px 8px;
+          border-radius: 10px;
+          color: #F2F2F7;
+          font-size: 12px;
+        }
+        QListWidget#QuickInputSuggestList::item:selected {
+          background: rgba(10, 132, 255, 0.20);
+        }
+        QListWidget#QuickInputSuggestList::item:hover {
+          background: rgba(242, 242, 247, 0.08);
         }
 
         QFrame#Sidebar {

@@ -4,9 +4,12 @@ from dataclasses import dataclass
 from datetime import date
 import math
 import random
+import re
 from typing import Iterable
 
 from PySide6 import QtCore, QtGui, QtWidgets  # type: ignore
+
+from mos_quant.core.stock_search import is_abbr_query, name_to_abbr, normalize_name
 
 
 @dataclass(frozen=True)
@@ -151,6 +154,7 @@ class _ElidedLabel(QtWidgets.QLabel):
 class _QuickInputOverlay(QtWidgets.QFrame):
     submitted = QtCore.Signal(str)
     active_changed = QtCore.Signal(bool)
+    query_changed = QtCore.Signal(str)
 
     def __init__(self, parent: QtWidgets.QWidget) -> None:
         super().__init__(parent)
@@ -163,8 +167,9 @@ class _QuickInputOverlay(QtWidgets.QFrame):
 
         self._edit = QtWidgets.QLineEdit()
         self._edit.setObjectName("QuickInputEdit")
-        self._edit.setPlaceholderText("输入…（Enter 提交，Esc 取消）")
+        self._edit.setPlaceholderText("代码/名称")
         self._edit.returnPressed.connect(self._on_return_pressed)
+        self._edit.textEdited.connect(self.query_changed.emit)
         self._edit.installEventFilter(self)
 
         lay = QtWidgets.QHBoxLayout()
@@ -174,7 +179,7 @@ class _QuickInputOverlay(QtWidgets.QFrame):
         lay.addWidget(self._edit, 1)
         self.setLayout(lay)
 
-        self.setFixedSize(420, 44)
+        self.setFixedSize(150, 32)
 
         shadow = QtWidgets.QGraphicsDropShadowEffect(self)
         shadow.setBlurRadius(26)
@@ -182,11 +187,31 @@ class _QuickInputOverlay(QtWidgets.QFrame):
         shadow.setColor(QtGui.QColor(0, 0, 0, 160))
         self.setGraphicsEffect(shadow)
 
+        self._suggest: _QuickSuggestPopup | None = None
+
+    def attach_suggest(self, popup: "_QuickSuggestPopup") -> None:
+        self._suggest = popup
+
     def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:  # noqa: N802
         if obj is self._edit and event.type() in (QtCore.QEvent.FocusIn, QtCore.QEvent.FocusOut):
             active = event.type() == QtCore.QEvent.FocusIn
             self._set_active(active)
             self.active_changed.emit(active)
+        if obj is self._edit and event.type() == QtCore.QEvent.KeyPress:
+            ev = event  # type: ignore[assignment]
+            if isinstance(ev, QtGui.QKeyEvent) and self._suggest is not None and self._suggest.isVisible():
+                key = ev.key()
+                if key == _qt_key("Key_Down"):
+                    self._suggest.move_selection(+1)
+                    return True
+                if key == _qt_key("Key_Up"):
+                    self._suggest.move_selection(-1)
+                    return True
+                if key in {_qt_key("Key_Return"), _qt_key("Key_Enter"), _qt_key("Key_Tab")}:
+                    picked = self._suggest.current_text()
+                    if picked:
+                        self._submit_text(picked)
+                        return True
         return super().eventFilter(obj, event)
 
     def show_and_focus(self) -> None:
@@ -206,12 +231,108 @@ class _QuickInputOverlay(QtWidgets.QFrame):
         self.style().polish(self)
         self.update()
 
+    def _submit_text(self, text: str) -> None:
+        cleaned = text.strip()
+        if not cleaned:
+            return
+        self.submitted.emit(cleaned)
+
+    def set_text(self, text: str) -> None:
+        self._edit.setText(text)
+        self._edit.setCursorPosition(len(text))
+
+    def text(self) -> str:
+        return self._edit.text()
+
     @QtCore.Slot()
     def _on_return_pressed(self) -> None:
         text = self._edit.text().strip()
         if not text:
             return
-        self.submitted.emit(text)
+        self._submit_text(text)
+
+
+class _QuickSuggestPopup(QtWidgets.QFrame):
+    activated = QtCore.Signal(str)
+
+    def __init__(self, parent: QtWidgets.QWidget) -> None:
+        super().__init__(parent)
+        self.setObjectName("QuickInputSuggest")
+        self.setAttribute(QtCore.Qt.WA_StyledBackground, True)
+        self.setVisible(False)
+
+        self._list = QtWidgets.QListWidget()
+        self._list.setObjectName("QuickInputSuggestList")
+        self._list.setUniformItemSizes(True)
+        self._list.setSpacing(2)
+        self._list.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self._list.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self._list.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+        self._list.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self._list.itemActivated.connect(lambda it: self.activated.emit(it.text()))
+        self._list.itemClicked.connect(lambda it: self.activated.emit(it.text()))
+
+        lay = QtWidgets.QVBoxLayout()
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(0)
+        lay.addWidget(self._list, 1)
+        self.setLayout(lay)
+
+        shadow = QtWidgets.QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(18)
+        shadow.setOffset(0, 8)
+        shadow.setColor(QtGui.QColor(0, 0, 0, 140))
+        self.setGraphicsEffect(shadow)
+
+    def set_items(self, items: list[str]) -> None:
+        self._list.clear()
+        for text in items:
+            it = QtWidgets.QListWidgetItem(text)
+            it.setSizeHint(QtCore.QSize(0, 28))
+            self._list.addItem(it)
+        if items:
+            self._list.setCurrentRow(0)
+
+    def current_text(self) -> str:
+        it = self._list.currentItem()
+        return "" if it is None else it.text().strip()
+
+    def move_selection(self, delta: int) -> None:
+        n = self._list.count()
+        if n <= 0:
+            return
+        cur = max(0, self._list.currentRow())
+        nxt = max(0, min(n - 1, cur + int(delta)))
+        self._list.setCurrentRow(nxt)
+        self._list.scrollToItem(self._list.currentItem(), QtWidgets.QAbstractItemView.PositionAtCenter)
+
+    def show_for_anchor(self, anchor: QtWidgets.QWidget) -> None:
+        if not self._list.count():
+            self.hide()
+            return
+        gap = 2
+        w = anchor.width()
+        item_h = 28
+        visible_rows = min(5, self._list.count())
+        h = 6 + visible_rows * item_h + 6
+        self.resize(w, min(200, h))
+
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        self.setProperty("active", bool(anchor.property("active")))
+        self.style().unpolish(self)
+        self.style().polish(self)
+        ax, ay = anchor.pos().x(), anchor.pos().y()
+        above_y = ay - self.height() - gap
+        below_y = ay + anchor.height() + gap
+        y = above_y if above_y >= 0 else below_y
+        x = ax
+        x = max(0, min(parent.width() - self.width(), x))
+        y = max(0, min(parent.height() - self.height(), y))
+        self.move(x, y)
+        self.setVisible(True)
+        self.raise_()
 
 
 class _ProbeTable(QtWidgets.QTableWidget):
@@ -1090,6 +1211,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("MoS Quant")
         self.resize(1040, 680)
         self._quick_input_last_focus: QtWidgets.QWidget | None = None
+        self._stock_index: list[tuple[str, str, str, str]] = []
+        self._quick_input_debounce = QtCore.QTimer(self)
+        self._quick_input_debounce.setSingleShot(True)
+        self._quick_input_debounce.setInterval(0)
+        self._quick_input_pending_query = ""
+        self._quick_input_last_query = ""
+
+        try:
+            df = getattr(ctx, "a_stock_list", None)
+            if df is not None and hasattr(df, "iterrows"):
+                for _idx, row in df.iterrows():
+                    code = str(row.get("code", "")).strip()
+                    name = str(row.get("name", "")).strip()
+                    if not code or not name:
+                        continue
+                    name_norm = normalize_name(name)
+                    abbr = name_to_abbr(name)
+                    self._stock_index.append((code, name, name_norm, abbr))
+        except Exception:
+            self._stock_index = []
 
         # ---- sidebar ----
         sidebar = QtWidgets.QFrame()
@@ -1157,8 +1298,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ---- quick input overlay (Enter to show, Esc to hide) ----
         self._quick_input = _QuickInputOverlay(root)
+        self._quick_suggest = _QuickSuggestPopup(root)
+        self._quick_suggest.activated.connect(self._quick_input.submitted.emit)
+        self._quick_input.attach_suggest(self._quick_suggest)
         self._quick_input.submitted.connect(self._on_quick_input_submitted)
         self._quick_input.active_changed.connect(self._on_quick_input_active_changed)
+        self._quick_input.query_changed.connect(self._on_quick_input_query_changed)
+        self._quick_input_debounce.timeout.connect(self._refresh_quick_input_suggestions)
         self._reposition_quick_input()
 
         self._show_quick_input_return = QtGui.QShortcut(
@@ -1200,6 +1346,8 @@ class MainWindow(QtWidgets.QMainWindow):
         x = max(0, host.width() - w - margin)
         y = max(0, host.height() - h - margin)
         self._quick_input.move(x, y)
+        if hasattr(self, "_quick_suggest") and self._quick_suggest.isVisible():
+            self._quick_suggest.show_for_anchor(self._quick_input)
 
     @QtCore.Slot()
     def _show_quick_input(self) -> None:
@@ -1209,12 +1357,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._quick_input_last_focus = QtWidgets.QApplication.focusWidget()
         self._reposition_quick_input()
         self._quick_input.show_and_focus()
+        self._quick_input_pending_query = self._quick_input.text()
+        self._quick_input_debounce.start()
 
     @QtCore.Slot()
     def _hide_quick_input(self) -> None:
         if not self._quick_input.isVisible():
             return
         self._quick_input.hide_overlay()
+        self._quick_suggest.hide()
+        self._quick_input_last_query = ""
         self._show_quick_input_return.setEnabled(True)
         self._show_quick_input_enter.setEnabled(True)
         if self._quick_input_last_focus is not None:
@@ -1228,7 +1380,102 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_quick_input_active_changed(self, active: bool) -> None:
         self._show_quick_input_return.setEnabled(not active)
         self._show_quick_input_enter.setEnabled(not active)
+        if not active:
+            self._quick_suggest.hide()
+            return
+        self._quick_input_pending_query = self._quick_input.text()
+        self._quick_input_debounce.start()
 
     @QtCore.Slot(str)
     def _on_quick_input_submitted(self, _text: str) -> None:
         self._hide_quick_input()
+
+    @QtCore.Slot(str)
+    def _on_quick_input_query_changed(self, text: str) -> None:
+        self._quick_input_pending_query = text
+        self._quick_input_debounce.start()
+
+    def _refresh_quick_input_suggestions(self) -> None:
+        query = self._quick_input_pending_query.strip()
+        if query == self._quick_input_last_query:
+            return
+        self._quick_input_last_query = query
+        if not query or not self._stock_index:
+            self._quick_suggest.hide()
+            return
+        suggestions = self._match_stock_suggestions(query, limit=12)
+        if not suggestions:
+            self._quick_suggest.hide()
+            return
+        self._quick_suggest.set_items(suggestions)
+        self._quick_suggest.show_for_anchor(self._quick_input)
+
+    def _match_stock_suggestions(self, query: str, *, limit: int = 12) -> list[str]:
+        q = query.strip()
+        q_norm = normalize_name(q)
+        is_digits = q_norm.isdigit()
+        is_abbr = (not is_digits) and is_abbr_query(q_norm)
+        limit = max(1, int(limit))
+
+        # Avoid huge candidate sets for very short numeric inputs like "0" or "00".
+        if is_digits and len(q_norm) < 2:
+            return []
+
+        buckets: dict[int, list[tuple[str, str]]] = {0: [], 1: [], 2: [], 3: [], 4: [], 5: [], 6: []}
+        if is_digits:
+            in_prefix_block = False
+            for code, name, name_norm, abbr in self._stock_index:
+                _ = (name_norm, abbr)
+                if code == q_norm:
+                    buckets[0].append((code, name))
+                    break
+                if code.startswith(q_norm):
+                    in_prefix_block = True
+                    if len(buckets[1]) < limit:
+                        buckets[1].append((code, name))
+                    continue
+                if in_prefix_block:
+                    # Since list is sorted by code, prefix matches are contiguous.
+                    # If we already have enough, don't scan the entire universe.
+                    if buckets[1]:
+                        break
+                if q_norm in code:
+                    if len(buckets[4]) < limit:
+                        buckets[4].append((code, name))
+                elif q_norm in name_norm:
+                    if len(buckets[6]) < limit:
+                        buckets[6].append((code, name))
+        elif is_abbr:
+            for code, name, name_norm, abbr in self._stock_index:
+                _ = name_norm
+                if not abbr:
+                    continue
+                if abbr.startswith(q_norm):
+                    if len(buckets[2]) < limit:
+                        buckets[2].append((code, name))
+                elif q_norm in abbr:
+                    if len(buckets[3]) < limit:
+                        buckets[3].append((code, name))
+                elif q_norm in code:
+                    if len(buckets[5]) < limit:
+                        buckets[5].append((code, name))
+        else:
+            for code, name, name_norm, abbr in self._stock_index:
+                _ = abbr
+                if name_norm.startswith(q_norm):
+                    if len(buckets[2]) < limit:
+                        buckets[2].append((code, name))
+                elif q_norm in name_norm:
+                    if len(buckets[3]) < limit:
+                        buckets[3].append((code, name))
+                elif q_norm in code:
+                    if len(buckets[5]) < limit:
+                        buckets[5].append((code, name))
+
+        out: list[str] = []
+        for k in (0, 1, 2, 3, 4, 5, 6):
+            for code, name in buckets[k]:
+                out.append(f"{code}  {name}")
+                if len(out) >= limit:
+                    return out
+        return out

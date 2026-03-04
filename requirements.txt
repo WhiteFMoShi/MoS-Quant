@@ -4,5 +4,6 @@ PySide6>=6.7.0
 pyarrow>=17.0.0
 pyqtgraph>=0.13.7
 mini-racer>=0.12.0
+pypinyin>=0.52.0
 requests>=2.32.0
 urllib3<2
